@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux x86-64,   os: ubuntu-latest }
+          - { name: linux arm64,    os: ubuntu-24.04-arm }
+          - { name: windows x86-64, os: windows-latest }
+          - { name: macos arm64,    os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (committed vectors, encoder, units)
+        run: cargo test --release
+      - name: Property tests and encoder self-check with overflow checks (debug)
+        run: cargo test --test fuzz --test encode
+
+  # The AOM AV1 test vectors (244 streams, about 7 MB), downloaded from
+  # AOMedia's aom-test-data bucket. Without the download the test
+  # skips; AV1_REQUIRE_VECTORS makes a missing set a failure here.
+  vectors:
+    name: test vectors (244 streams)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: tests/vectors
+          key: av1-vectors-${{ hashFiles('tools/vectors.txt') }}
+      - run: tools/fetch-vectors.sh
+      - name: Decode every vector, compare every frame's MD5
+        run: cargo test --release --test vectors -- --nocapture
+        env:
+          AV1_REQUIRE_VECTORS: "1"
+
+  msrv:
+    name: MSRV (1.99)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+  lint:
+    name: rustfmt, clippy and rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

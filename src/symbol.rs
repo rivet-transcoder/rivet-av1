@@ -141,7 +141,7 @@ impl<'a> SymbolDecoder<'a> {
         let pos = self.pos as i64;
         let trailing = pos - (self.max_bits + 15).min(15);
         let end = pos + self.max_bits.max(0);
-        if trailing < 0 || end as usize > self.data.len() * 8 {
+        if trailing < 0 || trailing as usize >= self.data.len() * 8 || end as usize > self.data.len() * 8 {
             return false;
         }
         let bit = |p: i64| (self.data[(p >> 3) as usize] >> (7 - (p & 7))) & 1;

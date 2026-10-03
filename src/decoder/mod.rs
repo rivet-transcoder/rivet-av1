@@ -115,6 +115,7 @@ pub struct Decoder {
     pub(crate) shown: Vec<Frame>,
     strict: bool,
     operating_point: usize,
+    max_pixels: u64,
 }
 
 impl Default for Decoder {
@@ -135,7 +136,15 @@ impl Decoder {
             shown: Vec::new(),
             strict: false,
             operating_point: 0,
+            max_pixels: 1 << 26,
         }
+    }
+
+    /// Frames (upscaled width times height) larger than this are refused
+    /// as a bitstream error rather than allocated. The default, 2^26
+    /// pixels, admits AV1's largest level (8K).
+    pub fn set_max_pixels(&mut self, max: u64) {
+        self.max_pixels = max;
     }
 
     /// Makes the decoder report a tile whose arithmetic-coded data does not
@@ -257,6 +266,9 @@ impl Decoder {
     /// previous segment map, the motion field, the sample buffers.
     pub(crate) fn setup_frame(&mut self, seq: Arc<SequenceHeader>, hdr: FrameHeader) -> Result<FrameCtx> {
         let c = &seq.color;
+        if hdr.upscaled_width as u64 * hdr.frame_height as u64 > self.max_pixels {
+            return Err(Error::bitstream("frame larger than the decoder's pixel limit"));
+        }
         let mi_rows = hdr.mi_rows;
         let mi_cols = hdr.mi_cols;
         if !hdr.frame_is_intra {
