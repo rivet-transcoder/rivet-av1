@@ -1,0 +1,88 @@
+//! An AV1 decoder and encoder.
+//!
+//! Rust, no C, no system libraries, no build script. Written from the AV1
+//! Bitstream & Decoding Process Specification (AOMedia) — the syntax of
+//! its section 5, the decoding process of section 7, the parsing process of
+//! section 8 and the tables of section 9 — and not translated from any
+//! other implementation.
+//!
+//! # Decoding
+//!
+//! ```no_run
+//! let mut dec = av1::Decoder::new();
+//! # let temporal_units: Vec<Vec<u8>> = Vec::new();
+//! for tu in &temporal_units {
+//!     if let Some(frame) = dec.decode(tu)? {
+//!         // frame.plane(0), frame.plane(1), frame.plane(2): Y, U, V
+//!     }
+//! }
+//! # Ok::<(), av1::Error>(())
+//! ```
+//!
+//! # Layout
+//!
+//! - `obu` — OBUs and the sequence header (5.3, 5.5).
+//! - `header` — the frame header (5.9).
+//! - `symbol`, `cdf` — the symbol decoder and the adaptive CDFs (8.2, 8.3).
+//! - [`decoder`] — tiles, mode info, motion vector prediction, prediction,
+//!   residual, the loop filter, CDEF, super-resolution, loop restoration,
+//!   film grain, reference management.
+//! - `dsp` — inverse transforms.
+//! - [`ivf`] — the IVF container.
+
+#![warn(missing_docs)]
+
+pub(crate) mod bits;
+pub(crate) mod cdf;
+pub(crate) mod consts;
+pub mod decoder;
+pub(crate) mod dsp;
+pub mod frame;
+pub(crate) mod header;
+pub mod ivf;
+pub(crate) mod obu;
+pub(crate) mod symbol;
+#[rustfmt::skip]
+pub(crate) mod tables;
+
+pub use decoder::Decoder;
+pub use frame::{ChromaFormat, ColorInfo, Frame, Plane};
+
+/// Errors the decoder and encoder can report.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The bitstream is malformed: a syntax element out of range, data cut
+    /// short, a reference to a frame that was never decoded.
+    #[error("bitstream error: {0}")]
+    Bitstream(String),
+    /// The stream is valid but uses a feature this crate does not
+    /// implement (yet). The message names it.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+    /// The caller's input is unusable: a frame of the wrong size or format,
+    /// an invalid configuration, a file that is not IVF.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+}
+
+/// `Result` with this crate's [`Error`].
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn bitstream(msg: impl Into<String>) -> Self {
+        Error::Bitstream(msg.into())
+    }
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn unsupported(msg: impl Into<String>) -> Self {
+        Error::Unsupported(msg.into())
+    }
+    #[cold]
+    #[inline(never)]
+    #[allow(dead_code)]
+    pub(crate) fn invalid(msg: impl Into<String>) -> Self {
+        Error::InvalidInput(msg.into())
+    }
+}
