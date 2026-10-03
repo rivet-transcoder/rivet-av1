@@ -312,16 +312,86 @@ impl TileDecoder<'_, '_> {
             }
             let (x, y, al, au, ar, bl, lw, lh, tx_sz) = self.intra_args(plane);
             self.predict_intra(plane, x, y, al, au, ar, bl, mode, lw, lh);
-            let t = if plane == 0 {
-                DCT_DCT
+            let eob = if plane == 0 {
+                self.choose_luma_tx_type(x, y, tx_sz)
             } else {
-                self.chroma_intra_tx_type(tx_sz, uv_mode)
+                let t = self.chroma_intra_tx_type(tx_sz, uv_mode);
+                self.quantise_block(plane, x, y, tx_sz, t)
             };
-            if self.quantise_block(plane, x, y, tx_sz, t) > 0 {
+            if eob > 0 {
                 return false;
             }
         }
         true
+    }
+
+    /// Chooses the luma transform type of an intra block (its prediction in
+    /// place) among the DCT and ADST combinations the reduced intra set
+    /// allows, by distortion plus estimated rate on the quantised
+    /// reconstruction; sets `plan.tx_type` and returns the end of block.
+    fn choose_luma_tx_type(&mut self, x: usize, y: usize, tx_sz: usize) -> usize {
+        let choice =
+            TX_SIZE_SQR_UP[tx_sz] <= TX_16X16 && self.f.hdr.base_q_idx > 0 && !self.b.lossless;
+        if !choice {
+            self.plan.tx_type = DCT_DCT;
+            return self.quantise_block(0, x, y, tx_sz, DCT_DCT);
+        }
+        let mut best = (DCT_DCT, f64::MAX);
+        for t in [DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST] {
+            let cost = self.trial_cost(x, y, tx_sz, t);
+            if cost < best.1 {
+                best = (t, cost);
+            }
+        }
+        self.plan.tx_type = best.0;
+        self.quantise_block(0, x, y, tx_sz, best.0)
+    }
+
+    /// Distortion plus lambda times estimated bits of coding the luma
+    /// residual at (x, y) with transform type `t`.
+    fn trial_cost(&mut self, x: usize, y: usize, tx_sz: usize, t: usize) -> f64 {
+        let eob = self.quantise_block(0, x, y, tx_sz, t);
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        let tw = w.min(32);
+        let th = h.min(32);
+        let bd = self.f.bit_depth;
+        let bdi = ((bd - 8) >> 1) as usize;
+        let q = self.f.hdr.base_q_idx as i32;
+        let dc_q = DC_QLOOKUP[bdi][clip3(0, 255, q + self.f.hdr.delta_q_y_dc) as usize] as i64;
+        let ac_q = AC_QLOOKUP[bdi][q as usize] as i64;
+        let denom: i64 = match tx_sz {
+            TX_32X32 | TX_16X32 | TX_32X16 => 2,
+            _ => 1,
+        };
+        let enc = self.enc.as_ref().expect("encode mode");
+        let mut dq = vec![0i32; 64 * 64];
+        let mut bits = 0f64;
+        for i in 0..th {
+            for j in 0..tw {
+                let l = enc.coefs[i * tw + j] as i64;
+                if l != 0 {
+                    bits += 2.0 + 2.0 * ((l.unsigned_abs() + 1) as f64).log2();
+                    let qq = if i == 0 && j == 0 { dc_q } else { ac_q };
+                    dq[i * 64 + j] = (l * qq / denom) as i32;
+                }
+            }
+        }
+        let mut rec = vec![0i32; w * h];
+        if eob > 0 {
+            crate::dsp::itx::inverse_transform_2d(&dq, tx_sz, t, false, bd, &mut rec);
+        }
+        let cur = &self.f.cur.planes[0];
+        let mut sse = 0f64;
+        for i in 0..h {
+            for j in 0..w {
+                let res = enc.src(0, x + j, y + i) - cur.get(x + j, y + i) as i32;
+                let d = (res - rec[i * w + j]) as f64;
+                sse += d * d;
+            }
+        }
+        let step = ac_q as f64 / (8 << (bd - 8)) as f64;
+        sse + 0.3 * step * step * (1 << (2 * (bd - 8))) as f64 * bits
     }
 
     /// The transform type the decoder derives for an intra chroma block.

@@ -232,6 +232,17 @@ fn argon() {
                         Ok(r) => r,
                         Err(_) => Err("panic".to_string()),
                     };
+                    if std::env::var("ARGON_VERBOSE").is_ok() {
+                        eprintln!(
+                            "{} {}",
+                            if matches!(r, Ok(true)) {
+                                "PASS"
+                            } else {
+                                "FAIL"
+                            },
+                            c.name
+                        );
+                    }
                     results.lock().unwrap().push((c.name.clone(), r));
                 }
             });

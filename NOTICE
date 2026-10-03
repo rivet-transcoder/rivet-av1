@@ -1,0 +1,50 @@
+rivet-av1 — an AV1 decoder and encoder
+Copyright 2026 Ely Erin Fox
+
+This product is licensed under the Open Encoding Attribution License,
+Version 1.0 (see LICENSE.md). It is source-available, not open source: the
+attribution duty in §5 applies to commercial use; §4 requires this NOTICE to
+be carried forward with any distribution.
+
+------------------------------------------------------------------------------
+Provenance
+------------------------------------------------------------------------------
+
+The decoder and encoder are original implementations written from the AV1
+Bitstream & Decoding Process Specification (Alliance for Open Media), in
+the text AOMedia publishes (https://aomediacodec.github.io/av1-spec/ and
+its source, https://github.com/AOMediaCodec/av1-spec). They are not
+translations of, and do not derive from, any other AV1 encoder's or
+decoder's source: no implementation's code (libaom, dav1d, rav1d, rav1e,
+SVT-AV1, FFmpeg's libavcodec or any other) was read, and none was run in
+testing. The specification's tables (default CDFs, scans, quantiser lookups
+and matrices, filter taps, block-size and transform-size lookups) are
+reproduced from it as data; tools/gen_tables.py extracts them from the
+specification's text and regenerates src/tables.rs.
+
+Correctness is checked against data published for decoder testing:
+
+  * AOMedia's AV1 test vectors — bitstreams and the MD5s of their decoded
+    frames, from https://storage.googleapis.com/aom-test-data/ — twelve of
+    which are included in tests/data (listed in its README);
+  * the Argon Streams AV1 conformance streams (v2.1, AOMedia's "AV1 video
+    decoder verification tool"), bitstreams and reference MD5s, used from a
+    local copy and not distributed with this crate. The suite's coverage
+    tool and viewer binaries were not run.
+
+------------------------------------------------------------------------------
+Patents
+------------------------------------------------------------------------------
+
+The Alliance for Open Media offers a royalty-free patent licence for AV1
+under its Patent License 1.0; third parties have asserted patents on AV1 as
+well. This licence grants no rights under any patent, and the authors make
+no claim about whether a licence is needed for any use.
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+thiserror (https://crates.io/crates/thiserror) — MIT OR Apache-2.0
+md5 (https://crates.io/crates/md5), development dependency only — MIT OR Apache-2.0
+proptest (https://crates.io/crates/proptest), development dependency only — MIT OR Apache-2.0

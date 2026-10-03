@@ -177,3 +177,42 @@ fn rate_control_tracks_the_target() {
     eprintln!("rate control: sizes {sizes:?}, inter average {inter_bits} bits for target {target}");
     assert!(inter_bits < target * 3 && inter_bits > target / 3);
 }
+
+/// The README table: sizes and PSNR at several quantisers on 8 frames of
+/// natural video (a key frame then seven inter frames). Run with
+/// `cargo test --release --test encode -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn quality_table() {
+    let src = natural(8);
+    eprintln!(
+        "| quantiser | bytes (8 frames) | key frame | per inter frame | PSNR Y | PSNR U | PSNR V |"
+    );
+    for q in [20, 50, 90, 130, 170, 210, 250] {
+        let mut cfg = Config::new(src[0].width, src[0].height);
+        cfg.quantizer = q;
+        let (dec, sizes) = round_trip(cfg, &src);
+        let n = src.len() as f64;
+        let p = |pl: usize| {
+            src.iter()
+                .zip(&dec)
+                .map(|(a, b)| psnr(a, b, pl))
+                .sum::<f64>()
+                / n
+        };
+        let total: usize = sizes.iter().sum();
+        let inter = (total - sizes[0]) / (sizes.len() - 1);
+        eprintln!(
+            "| {q} | {total} | {} | {inter} | {:.2} dB | {:.2} dB | {:.2} dB |",
+            sizes[0],
+            p(0),
+            p(1),
+            p(2)
+        );
+    }
+    let mut cfg = Config::new(src[0].width, src[0].height);
+    cfg.quantizer = 90;
+    cfg.keyframe_interval = 1;
+    let (_, sizes) = round_trip(cfg, &src);
+    eprintln!("all-intra at 90: {} bytes", sizes.iter().sum::<usize>());
+}
