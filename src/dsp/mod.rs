@@ -3,6 +3,7 @@
 //! scalar version (and tested against it).
 
 pub(crate) mod cdef;
+pub(crate) mod enc;
 pub(crate) mod itx;
 pub(crate) mod lf;
 pub(crate) mod mc;
