@@ -107,12 +107,12 @@ impl FrameCtx {
 
 /// Decodes AV1 temporal units into frames.
 pub struct Decoder {
-    seq: Option<Arc<SequenceHeader>>,
-    ref_state: RefState,
-    refs: [Option<Arc<RefData>>; 8],
+    pub(crate) seq: Option<Arc<SequenceHeader>>,
+    pub(crate) ref_state: RefState,
+    pub(crate) refs: [Option<Arc<RefData>>; 8],
     frame: Option<FrameCtx>,
     seen_frame_header: bool,
-    shown: Vec<Frame>,
+    pub(crate) shown: Vec<Frame>,
     strict: bool,
     operating_point: usize,
 }
@@ -255,7 +255,7 @@ impl Decoder {
 
     /// Sets up the frame state after `uncompressed_header()`: CDFs, the
     /// previous segment map, the motion field, the sample buffers.
-    fn setup_frame(&mut self, seq: Arc<SequenceHeader>, hdr: FrameHeader) -> Result<FrameCtx> {
+    pub(crate) fn setup_frame(&mut self, seq: Arc<SequenceHeader>, hdr: FrameHeader) -> Result<FrameCtx> {
         let c = &seq.color;
         let mi_rows = hdr.mi_rows;
         let mi_cols = hdr.mi_cols;
@@ -426,18 +426,24 @@ impl Decoder {
             f.tile_num = tile_num + 1;
         }
         if tg_end == num_tiles - 1 {
-            let mut f = self.frame.take().expect("frame in progress");
-            if !f.hdr.disable_frame_end_update_cdf {
-                if let Some(s) = f.saved_cdfs.take() {
-                    // frame_end_update_cdf(); the counters do not matter: every
-                    // load clears them.
-                    f.cdfs = s;
-                }
-            }
-            self.decode_frame_wrapup(f)?;
+            let f = self.frame.take().expect("frame in progress");
+            self.finish_frame(f)?;
             self.seen_frame_header = false;
         }
         Ok(())
+    }
+
+    /// After the last tile: `frame_end_update_cdf()` and the decode frame
+    /// wrapup process.
+    pub(crate) fn finish_frame(&mut self, mut f: FrameCtx) -> Result<()> {
+        if !f.hdr.disable_frame_end_update_cdf {
+            if let Some(s) = f.saved_cdfs.take() {
+                // frame_end_update_cdf(); the counters do not matter: every
+                // load clears them.
+                f.cdfs = s;
+            }
+        }
+        self.decode_frame_wrapup(f)
     }
 
     /// The decode frame wrapup process (7.4) for a decoded frame.

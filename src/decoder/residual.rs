@@ -240,7 +240,7 @@ impl TileDecoder<'_, '_> {
     }
 
     /// `compute_tx_type( plane, txSz, blockX, blockY )`.
-    fn compute_tx_type(&self, plane: usize, tx_sz: usize, block_x: usize, block_y: usize) -> usize {
+    pub(crate) fn compute_tx_type(&self, plane: usize, tx_sz: usize, block_x: usize, block_y: usize) -> usize {
         let sqr_up = TX_SIZE_SQR_UP[tx_sz];
         if self.b.lossless || sqr_up > TX_32X32 {
             return DCT_DCT;
@@ -278,13 +278,16 @@ impl TileDecoder<'_, '_> {
             let sqr = TX_SIZE_SQR[tx_sz];
             if self.b.is_inter {
                 if set == TX_SET_INTER_1 {
-                    let s = self.sd.read_symbol(&mut self.cdf.inter_tx_type_set1[sqr]);
+                    let p = inv_index(&TX_TYPE_INTER_INV_SET1, self.enc_tx_type);
+                    let s = self.sd.symbol(&mut self.cdf.inter_tx_type_set1[sqr], p);
                     TX_TYPE_INTER_INV_SET1[s]
                 } else if set == TX_SET_INTER_2 {
-                    let s = self.sd.read_symbol(&mut self.cdf.inter_tx_type_set2);
+                    let p = inv_index(&TX_TYPE_INTER_INV_SET2, self.enc_tx_type);
+                    let s = self.sd.symbol(&mut self.cdf.inter_tx_type_set2, p);
                     TX_TYPE_INTER_INV_SET2[s]
                 } else {
-                    let s = self.sd.read_symbol(&mut self.cdf.inter_tx_type_set3[sqr]);
+                    let p = inv_index(&TX_TYPE_INTER_INV_SET3, self.enc_tx_type);
+                    let s = self.sd.symbol(&mut self.cdf.inter_tx_type_set3[sqr], p);
                     TX_TYPE_INTER_INV_SET3[s]
                 }
             } else {
@@ -294,10 +297,12 @@ impl TileDecoder<'_, '_> {
                     self.b.y_mode
                 };
                 if set == TX_SET_INTRA_1 {
-                    let s = self.sd.read_symbol(&mut self.cdf.intra_tx_type_set1[sqr][intra_dir]);
+                    let p = inv_index(&TX_TYPE_INTRA_INV_SET1, self.enc_tx_type);
+                    let s = self.sd.symbol(&mut self.cdf.intra_tx_type_set1[sqr][intra_dir], p);
                     TX_TYPE_INTRA_INV_SET1[s]
                 } else {
-                    let s = self.sd.read_symbol(&mut self.cdf.intra_tx_type_set2[sqr][intra_dir]);
+                    let p = inv_index(&TX_TYPE_INTRA_INV_SET2, self.enc_tx_type);
+                    let s = self.sd.symbol(&mut self.cdf.intra_tx_type_set2[sqr][intra_dir], p);
                     TX_TYPE_INTRA_INV_SET2[s]
                 }
             }
@@ -319,48 +324,7 @@ impl TileDecoder<'_, '_> {
     }
 
     fn get_scan(&self, tx_sz: usize) -> &'static [u16] {
-        if tx_sz == TX_16X64 {
-            return &DEFAULT_SCAN_16X32;
-        }
-        if tx_sz == TX_64X16 {
-            return &DEFAULT_SCAN_32X16;
-        }
-        if TX_SIZE_SQR_UP[tx_sz] == TX_64X64 {
-            return &DEFAULT_SCAN_32X32;
-        }
-        let t = self.plane_tx_type;
-        if t == IDTX {
-            return default_scan(tx_sz);
-        }
-        let prefer_row = t == V_DCT || t == V_ADST || t == V_FLIPADST;
-        let prefer_col = t == H_DCT || t == H_ADST || t == H_FLIPADST;
-        if prefer_row {
-            match tx_sz {
-                TX_4X4 => &MROW_SCAN_4X4,
-                TX_4X8 => &MROW_SCAN_4X8,
-                TX_8X4 => &MROW_SCAN_8X4,
-                TX_8X8 => &MROW_SCAN_8X8,
-                TX_8X16 => &MROW_SCAN_8X16,
-                TX_16X8 => &MROW_SCAN_16X8,
-                TX_16X16 => &MROW_SCAN_16X16,
-                TX_4X16 => &MROW_SCAN_4X16,
-                _ => &MROW_SCAN_16X4,
-            }
-        } else if prefer_col {
-            match tx_sz {
-                TX_4X4 => &MCOL_SCAN_4X4,
-                TX_4X8 => &MCOL_SCAN_4X8,
-                TX_8X4 => &MCOL_SCAN_8X4,
-                TX_8X8 => &MCOL_SCAN_8X8,
-                TX_8X16 => &MCOL_SCAN_8X16,
-                TX_16X8 => &MCOL_SCAN_16X8,
-                TX_16X16 => &MCOL_SCAN_16X16,
-                TX_4X16 => &MCOL_SCAN_4X16,
-                _ => &MCOL_SCAN_16X4,
-            }
-        } else {
-            default_scan(tx_sz)
-        }
+        scan_for(tx_sz, self.plane_tx_type)
     }
 
     /// `coeffs( plane, startX, startY, txSz )`: returns `eob`.
@@ -380,8 +344,14 @@ impl TileDecoder<'_, '_> {
         let mut eob = 0usize;
         let mut cul_level: u32 = 0;
         let mut dc_category = 0u8;
+        // Encode mode: the encoder chooses the levels now, the prediction
+        // being in place; `target` holds them in Quant's layout.
+        let mut target_eob = 0usize;
+        if self.sd.encoding() {
+            target_eob = self.enc_choose_coeffs(plane, start_x, start_y, tx_sz);
+        }
         let ctx = self.all_zero_ctx(plane, tx_sz, x4, y4, w4, h4);
-        let all_zero = self.sd.read_symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx]) != 0;
+        let all_zero = self.sd.symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx], (target_eob == 0) as usize) != 0;
         if all_zero {
             if plane == 0 {
                 self.set_tx_types(x4, y4, tx_sz, DCT_DCT);
@@ -395,14 +365,21 @@ impl TileDecoder<'_, '_> {
             let eob_multisize = TX_WIDTH_LOG2[tx_sz].min(5) + TX_HEIGHT_LOG2[tx_sz].min(5) - 4;
             let tx_class = get_tx_class(self.plane_tx_type);
             let ectx = if tx_class == TX_CLASS_2D { 0 } else { 1 };
+            let t_pt = if target_eob <= 2 {
+                target_eob
+            } else {
+                crate::bits::floor_log2(target_eob as u32 - 1) as usize + 2
+            };
+            let t_rest = if t_pt >= 3 { target_eob - ((1 << (t_pt - 2)) + 1) } else { 0 };
+            let p = t_pt.saturating_sub(1);
             let eob_pt = 1 + match eob_multisize {
-                0 => self.sd.read_symbol(&mut self.cdf.eob_pt_16[ptype][ectx]),
-                1 => self.sd.read_symbol(&mut self.cdf.eob_pt_32[ptype][ectx]),
-                2 => self.sd.read_symbol(&mut self.cdf.eob_pt_64[ptype][ectx]),
-                3 => self.sd.read_symbol(&mut self.cdf.eob_pt_128[ptype][ectx]),
-                4 => self.sd.read_symbol(&mut self.cdf.eob_pt_256[ptype][ectx]),
-                5 => self.sd.read_symbol(&mut self.cdf.eob_pt_512[ptype]),
-                _ => self.sd.read_symbol(&mut self.cdf.eob_pt_1024[ptype]),
+                0 => self.sd.symbol(&mut self.cdf.eob_pt_16[ptype][ectx], p),
+                1 => self.sd.symbol(&mut self.cdf.eob_pt_32[ptype][ectx], p),
+                2 => self.sd.symbol(&mut self.cdf.eob_pt_64[ptype][ectx], p),
+                3 => self.sd.symbol(&mut self.cdf.eob_pt_128[ptype][ectx], p),
+                4 => self.sd.symbol(&mut self.cdf.eob_pt_256[ptype][ectx], p),
+                5 => self.sd.symbol(&mut self.cdf.eob_pt_512[ptype], p),
+                _ => self.sd.symbol(&mut self.cdf.eob_pt_1024[ptype], p),
             };
             eob = if eob_pt < 2 {
                 eob_pt
@@ -411,14 +388,15 @@ impl TileDecoder<'_, '_> {
             };
             let eob_shift = eob_pt as i32 - 3;
             if eob_shift >= 0 {
-                let eob_extra = self.sd.read_symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3]);
+                let pe = (t_rest >> eob_shift.max(0)) & 1;
+                let eob_extra = self.sd.symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3], pe);
                 if eob_extra != 0 {
                     eob += 1 << eob_shift;
                 }
                 let lim = (eob_pt as i32 - 2).max(0);
                 for i in 1..lim {
                     let eob_shift = lim - 1 - i;
-                    if self.sd.read_literal(1) != 0 {
+                    if self.sd.literal(1, ((t_rest >> eob_shift) & 1) as u32) != 0 {
                         eob += 1 << eob_shift;
                     }
                 }
@@ -431,16 +409,20 @@ impl TileDecoder<'_, '_> {
                 let mut level;
                 if c == eob - 1 {
                     let ctx = coeff_base_eob_ctx(c, bwl, height);
-                    level = self.sd.read_symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx]) as u32 + 1;
+                    let p = (self.enc_level(pos).min(3).max(1) - 1) as usize;
+                    level = self.sd.symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], p) as u32 + 1;
                 } else {
                     let ctx = self.coeff_base_ctx(tx_sz, tx_class, bwl, height, pos);
-                    level = self.sd.read_symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx]) as u32;
+                    let p = self.enc_level(pos).min(3) as usize;
+                    level = self.sd.symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], p) as u32;
                 }
                 if level > NUM_BASE_LEVELS {
                     let br_ctx = self.coeff_br_ctx(tx_sz, tx_class, pos);
                     for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
-                        let coeff_br = self.sd.read_symbol(
+                        let p = (self.enc_level(pos).min(15).saturating_sub(level)).min(3) as usize;
+                        let coeff_br = self.sd.symbol(
                             &mut self.cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype][br_ctx],
+                            p,
                         ) as u32;
                         level += coeff_br;
                         if coeff_br < BR_CDF_SIZE - 1 {
@@ -455,18 +437,22 @@ impl TileDecoder<'_, '_> {
                 let sign = if self.quant[pos] != 0 {
                     if c == 0 {
                         let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
-                        self.sd.read_symbol(&mut self.cdf.dc_sign[ptype][ctx]) as u32
+                        let p = (self.enc_coef(pos) < 0) as usize;
+                        self.sd.symbol(&mut self.cdf.dc_sign[ptype][ctx], p) as u32
                     } else {
-                        self.sd.read_literal(1)
+                        self.sd.literal(1, (self.enc_coef(pos) < 0) as u32)
                     }
                 } else {
                     0
                 };
                 if self.quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+                    // Encode mode: x = level - 14, coded as Exp-Golomb.
+                    let gx = (self.enc_level(pos).max(15) - 14) as u32;
+                    let glen = crate::bits::floor_log2(gx) + 1;
                     let mut length = 0;
                     loop {
                         length += 1;
-                        let golomb_length_bit = self.sd.read_literal(1);
+                        let golomb_length_bit = self.sd.literal(1, (length == glen) as u32);
                         if golomb_length_bit != 0 {
                             break;
                         }
@@ -475,8 +461,8 @@ impl TileDecoder<'_, '_> {
                         }
                     }
                     let mut x: u32 = 1;
-                    for _ in (0..length - 1).rev() {
-                        x = (x << 1) | self.sd.read_literal(1);
+                    for i in (0..length - 1).rev() {
+                        x = (x << 1) | self.sd.literal(1, (gx >> i) & 1);
                     }
                     self.quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64).min(i32::MAX as u64) as i32;
                 }
@@ -740,6 +726,56 @@ impl TileDecoder<'_, '_> {
                 cur.set(x + xx, y + yy, (p + self.residual[i * w + j]).clamp(0, maxv) as u16);
             }
         }
+    }
+}
+
+/// The index of `v` in a transform type inversion table (encode mode).
+fn inv_index(tbl: &[usize], v: usize) -> usize {
+    tbl.iter().position(|&t| t == v).unwrap_or(0)
+}
+
+/// `get_scan( txSz )` for a block of transform type `t` (`PlaneTxType`).
+pub(crate) fn scan_for(tx_sz: usize, t: usize) -> &'static [u16] {
+    if tx_sz == TX_16X64 {
+        return &DEFAULT_SCAN_16X32;
+    }
+    if tx_sz == TX_64X16 {
+        return &DEFAULT_SCAN_32X16;
+    }
+    if TX_SIZE_SQR_UP[tx_sz] == TX_64X64 {
+        return &DEFAULT_SCAN_32X32;
+    }
+    if t == IDTX {
+        return default_scan(tx_sz);
+    }
+    let prefer_row = t == V_DCT || t == V_ADST || t == V_FLIPADST;
+    let prefer_col = t == H_DCT || t == H_ADST || t == H_FLIPADST;
+    if prefer_row {
+        match tx_sz {
+            TX_4X4 => &MROW_SCAN_4X4,
+            TX_4X8 => &MROW_SCAN_4X8,
+            TX_8X4 => &MROW_SCAN_8X4,
+            TX_8X8 => &MROW_SCAN_8X8,
+            TX_8X16 => &MROW_SCAN_8X16,
+            TX_16X8 => &MROW_SCAN_16X8,
+            TX_16X16 => &MROW_SCAN_16X16,
+            TX_4X16 => &MROW_SCAN_4X16,
+            _ => &MROW_SCAN_16X4,
+        }
+    } else if prefer_col {
+        match tx_sz {
+            TX_4X4 => &MCOL_SCAN_4X4,
+            TX_4X8 => &MCOL_SCAN_4X8,
+            TX_8X4 => &MCOL_SCAN_8X4,
+            TX_8X8 => &MCOL_SCAN_8X8,
+            TX_8X16 => &MCOL_SCAN_8X16,
+            TX_16X8 => &MCOL_SCAN_16X8,
+            TX_16X16 => &MCOL_SCAN_16X16,
+            TX_4X16 => &MCOL_SCAN_4X16,
+            _ => &MCOL_SCAN_16X4,
+        }
+    } else {
+        default_scan(tx_sz)
     }
 }
 

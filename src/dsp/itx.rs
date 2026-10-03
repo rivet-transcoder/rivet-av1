@@ -460,6 +460,29 @@ fn run(t: &mut [i32], kind: Kind, n: u32, r: u32, lossless: bool, wht_shift: u32
     }
 }
 
+/// One 1D inverse transform, without intermediate clamping (`r` wide
+/// enough): 0 DCT, 1 ADST, 2 identity, of length `1 << n`. The encoder
+/// derives its forward transforms from these.
+pub(crate) fn inverse_1d(kind: u8, n: u32, t: &mut [i32]) {
+    let k = match kind {
+        0 => Kind::Dct,
+        1 => Kind::Adst,
+        _ => Kind::Identity,
+    };
+    run(t, k, n, 30, false, 0);
+}
+
+/// Which 1D transforms a type applies: `(rows, columns)`, 0 DCT, 1 ADST,
+/// 2 identity.
+pub(crate) fn kinds(tx_type: usize) -> (u8, u8) {
+    let f = |k: Kind| match k {
+        Kind::Dct => 0,
+        Kind::Adst => 1,
+        Kind::Identity => 2,
+    };
+    (f(row_kind(tx_type)), f(col_kind(tx_type)))
+}
+
 /// The 2D inverse transform process (7.13.3). `dequant` is the
 /// `Dequant` array with a row stride of 64 (only its top-left 32x32 can be
 /// non-zero); the result is written to `residual` with a row stride of `w`.
