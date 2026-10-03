@@ -83,6 +83,7 @@ fn apply(cfg: &mut Config, name: &str, value: &str) {
         }
         "tiles" => cfg.tile_cols_log2 = n() as u32,
         "threads" => cfg.threads = n() as usize,
+        "altref" => cfg.altref = n() as u32,
         _ => {
             if !cfg.tools.set(name, n() as u32) {
                 panic!("unknown setting {name}");
@@ -114,20 +115,33 @@ fn run(path: &str, frames: &[Frame], q: u32, sets: &[(String, String)]) -> Point
     let mut se = [0f64; 3];
     let mut n = [0u64; 3];
     let start = Instant::now();
-    for (i, f) in frames.iter().enumerate() {
-        let tu = enc.encode(f).unwrap();
+    // (With alt-ref groups the encoder holds frames: a temporal unit comes
+    // out for each frame, in order, but later.)
+    let mut shown = 0;
+    let mut take = |tu: Vec<u8>, enc: &Encoder| {
         bytes += tu.len() as u64;
         let d = dec.decode(&tu).unwrap().expect("a shown frame");
         assert!(
             Some(&d) == enc.reconstruction(),
-            "{path} q {q} frame {i}: the decoder disagrees with the reconstruction"
+            "{path} q {q} frame {shown}: the decoder disagrees with the reconstruction"
         );
         for p in 0..3 {
-            let (s, c) = sse(f, &d, p);
+            let (s, c) = sse(&frames[shown], &d, p);
             se[p] += s;
             n[p] += c;
         }
+        shown += 1;
+    };
+    for f in frames {
+        let tu = enc.encode(f).unwrap();
+        if !tu.is_empty() {
+            take(tu, &enc);
+        }
     }
+    while let Some(tu) = enc.flush().unwrap() {
+        take(tu, &enc);
+    }
+    assert_eq!(shown, frames.len(), "{path}: a temporal unit per frame");
     let seconds = start.elapsed().as_secs_f64();
     let p: Vec<f64> = (0..3).map(|i| psnr(se[i], n[i], bd)).collect();
     let yuv = (6.0 * p[0] + p[1] + p[2]) / 8.0;

@@ -272,12 +272,21 @@ Speeds 4 and 8 land likewise: within 2.6 %, but for the still clip at
 
 Not there yet:
 
-- **Reordering**: frames are coded in display order; no hidden alt-ref
-  frame (`show_existing_frame`), no temporal filtering, no backward
-  references (compound is unidirectional).
-- **Adaptive quantisation** (delta q, segmentation), filter intra, intra
-  block copy, OBMC and warped motion, wedge / difference-weighted compound,
-  inter-intra, switchable interpolation filters, film grain parameters.
+- **Reordering that pays**: `Config::altref` codes groups of frames with a
+  hidden alt-ref frame first (not shown, a backward reference and a
+  compound partner for the frames before it, then shown with
+  `show_existing_frame`; the encoder holds the group's frames and
+  `Encoder::flush` hands out the rest), but without temporal filtering of
+  the alt-ref frame or a quantiser hierarchy it costs more than it saves on
+  the test clips (+2.1 % BD-rate in groups of 8 at speed 4, +0.1 % at
+  speed 6), so it is off by default.
+- **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
+  superblock (`delta_qindex`) from a temporal-importance estimate (the
+  previous frame's prediction of each superblock), −0.2 % to +0.2 % on the
+  test clips; off by default. No segmentation.
+- Filter intra, intra block copy, OBMC and warped motion, wedge /
+  difference-weighted compound, inter-intra, switchable interpolation
+  filters, film grain parameters.
 - **Profiles 1 and 2**, 12-bit, monochrome; lossless (quantiser 0 needs the
   forward Walsh-Hadamard transform).
 - **Lookahead**: rate control plans from the frames already coded (a

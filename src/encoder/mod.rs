@@ -81,6 +81,16 @@ pub struct Config {
     /// Threads coding tiles in parallel (with several tile columns); 1
     /// codes on the caller's thread.
     pub threads: usize,
+    /// Hidden alt-ref frames: frames are coded in groups of this many (3 or
+    /// more; 0 off), the last frame of each group first, as a frame not
+    /// shown (finer, a backward reference for the others), then the others
+    /// in order, then a `show_existing_frame` showing it. The encoder holds
+    /// up to this many frames: [`Encoder::encode`] returns an empty vector
+    /// while it does, and [`Encoder::flush`] returns the rest. Needs
+    /// `Tools::multi_ref`. Off by default: without temporal filtering of
+    /// the alt-ref frame it has not paid on the encoder's test clips (+2 %
+    /// BD-rate in groups of 8 at speed 4, ±0 at speed 6).
+    pub altref: u32,
 }
 
 /// The encoder's coding tools, each switchable (for measurement, or to
@@ -301,6 +311,7 @@ impl Config {
             tile_cols_log2: 0,
             tools: Tools::for_speed(DEFAULT_SPEED),
             threads: 1,
+            altref: 0,
         }
     }
 }
@@ -312,7 +323,18 @@ pub struct Encoder {
     /// The decoder whose reference state and in-loop filters the encoder
     /// shares; its output is the encoder's reconstruction.
     dec: Decoder,
+    /// Frames coded (shown or not).
     frame_num: u64,
+    /// Frames shown so far: the display index (order hint) of the next.
+    shown: u64,
+    /// Frames waiting for their group (alt-ref mode), and whether a key
+    /// frame was forced at each.
+    queue: std::collections::VecDeque<(Frame, bool)>,
+    /// Temporal units ready to hand out (alt-ref mode), each with its shown
+    /// frame's reconstruction and whether it is a key frame.
+    ready: std::collections::VecDeque<(Vec<u8>, Option<Frame>, bool)>,
+    /// The slot of the hidden alt-ref frame not yet shown.
+    arf_slot: Option<usize>,
     /// Frames since the last key frame.
     since_key: u64,
     /// The next frame is to be a key frame whatever the interval says.
@@ -362,6 +384,22 @@ struct FrameParams {
     tile_cols_log2: u32,
     /// Adaptive quantisation: each superblock's quantiser.
     aq: Option<Arc<tile::AqMap>>,
+    /// `show_frame` (a hidden alt-ref frame is not shown).
+    show: bool,
+    /// The frame's display index.
+    order_hint: u64,
+}
+
+/// What a coded frame is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Key,
+    Inter,
+    /// A hidden alt-ref frame: the frame `ahead` frames after the next
+    /// shown one.
+    AltRef {
+        ahead: u64,
+    },
 }
 
 /// What a second coding pass replays.
@@ -467,6 +505,10 @@ impl Encoder {
             seq: Arc::new(seq),
             dec,
             frame_num: 0,
+            shown: 0,
+            queue: Default::default(),
+            ready: Default::default(),
+            arf_slot: None,
             since_key: 0,
             force_key: false,
             last_key: false,
@@ -498,7 +540,7 @@ impl Encoder {
     /// Whether the next frame will be a key frame.
     pub fn next_is_keyframe(&self) -> bool {
         self.force_key
-            || self.frame_num == 0
+            || self.shown == 0
             || self.since_key >= self.cfg.keyframe_interval.max(1) as u64
     }
 
@@ -533,7 +575,144 @@ impl Encoder {
             return Err(Error::invalid("bit depth must be 8 or 10"));
         }
         check_color(&cfg.color)?;
-        let key = self.next_is_keyframe();
+        if !self.altref_groups() {
+            let key = self.next_is_keyframe();
+            self.force_key = false;
+            let (obus, recon) = self.code_one(frame, if key { Role::Key } else { Role::Inter })?;
+            let tu = self.temporal_unit(key, &[], &obus);
+            self.recon = recon;
+            self.last_key = key;
+            return Ok(tu);
+        }
+        let forced = std::mem::take(&mut self.force_key);
+        self.queue.push_back((frame.clone(), forced));
+        self.pump(false)?;
+        Ok(self.pop_ready().unwrap_or_default())
+    }
+
+    /// The temporal units of the frames the encoder still holds (alt-ref
+    /// mode), one a call, in order; `None` once there are none. The
+    /// encoder can take more frames afterwards.
+    pub fn flush(&mut self) -> Result<Option<Vec<u8>>> {
+        self.pump(true)?;
+        Ok(self.pop_ready())
+    }
+
+    fn altref_groups(&self) -> bool {
+        self.cfg.altref >= 3 && self.cfg.tools.multi_ref
+    }
+
+    /// The next ready temporal unit, its reconstruction and key flag made
+    /// current.
+    fn pop_ready(&mut self) -> Option<Vec<u8>> {
+        let (tu, recon, key) = self.ready.pop_front()?;
+        self.recon = recon;
+        self.last_key = key;
+        Some(tu)
+    }
+
+    /// Codes the frames held whose group is complete (all of them when
+    /// `all`).
+    fn pump(&mut self, all: bool) -> Result<()> {
+        while let Some(&(_, forced)) = self.queue.front() {
+            let interval = self.cfg.keyframe_interval.max(1) as u64;
+            if forced || self.shown == 0 || self.since_key >= interval {
+                let (frame, _) = self.queue.pop_front().expect("a frame");
+                let (obus, recon) = self.code_one(&frame, Role::Key)?;
+                let tu = self.temporal_unit(true, &[], &obus);
+                self.ready.push_back((tu, recon, true));
+                continue;
+            }
+            // The group: up to the alt-ref interval, not past the next key
+            // frame (by the interval, or forced).
+            let mut g = (self.cfg.altref as u64).min(interval - self.since_key) as usize;
+            if let Some(k) = self.queue.iter().skip(1).position(|q| q.1) {
+                g = g.min(k + 1);
+            }
+            if self.queue.len() < g {
+                if !all {
+                    break;
+                }
+                g = self.queue.len();
+            }
+            if g < 3 {
+                let (frame, _) = self.queue.pop_front().expect("a frame");
+                let (obus, recon) = self.code_one(&frame, Role::Inter)?;
+                let tu = self.temporal_unit(false, &[], &obus);
+                self.ready.push_back((tu, recon, false));
+                continue;
+            }
+            // The alt-ref first, hidden; it goes out with the first frame.
+            let arf = self.queue[g - 1].0.clone();
+            let (mut hidden, _) = self.code_one(
+                &arf,
+                Role::AltRef {
+                    ahead: g as u64 - 1,
+                },
+            )?;
+            for _ in 0..g - 1 {
+                let (frame, _) = self.queue.pop_front().expect("a frame");
+                let (obus, recon) = self.code_one(&frame, Role::Inter)?;
+                let tu = self.temporal_unit(false, &hidden, &obus);
+                hidden.clear();
+                self.ready.push_back((tu, recon, false));
+            }
+            self.queue.pop_front();
+            let (tu, recon) = self.show_alt_ref()?;
+            self.ready.push_back((tu, recon, false));
+        }
+        Ok(())
+    }
+
+    /// A temporal unit: the delimiter, on key frames the sequence header and
+    /// metadata, then `hidden` (frame OBUs not shown) and `obus`.
+    fn temporal_unit(&self, key: bool, hidden: &[u8], obus: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_obu(&mut out, OBU_TEMPORAL_DELIMITER, &[]);
+        if key {
+            write_obu(&mut out, OBU_SEQUENCE_HEADER, &self.seq.write());
+            if let Some(c) = &self.cfg.hdr.content_light {
+                write_obu(&mut out, OBU_METADATA, &crate::obu::write_hdr_cll(c));
+            }
+            if let Some(m) = &self.cfg.hdr.mastering_display {
+                write_obu(&mut out, OBU_METADATA, &crate::obu::write_hdr_mdcv(m));
+            }
+        }
+        out.extend_from_slice(hidden);
+        out.extend_from_slice(obus);
+        out
+    }
+
+    /// The temporal unit that shows the pending alt-ref frame
+    /// (`show_existing_frame`), and its reconstruction.
+    fn show_alt_ref(&mut self) -> Result<(Vec<u8>, Option<Frame>)> {
+        let slot = self.arf_slot.take().expect("an alt-ref frame to show");
+        let mut w = BitWriter::new();
+        w.flag(true); // show_existing_frame
+        w.f(3, slot as u32); // frame_to_show_map_idx
+        w.byte_align();
+        let mut tu = Vec::new();
+        write_obu(&mut tu, OBU_TEMPORAL_DELIMITER, &[]);
+        write_obu(&mut tu, OBU_FRAME_HEADER, &w.finish());
+        // The encoder's decoder shows it as any decoder will.
+        let mut recon = self.dec.decode(&tu)?;
+        if let Some(r) = recon.as_mut() {
+            r.hdr = self.cfg.hdr;
+        }
+        self.last2_slot = self.last_slot;
+        self.last_slot = slot;
+        self.shown += 1;
+        self.since_key += 1;
+        if let Some(rc) = self.rc.as_mut() {
+            rc.account_shown(tu.len() as u64 * 8);
+        }
+        Ok((tu, recon))
+    }
+
+    /// Codes one frame and commits it to the reference state: its frame
+    /// OBU, and its reconstruction when it is shown.
+    fn code_one(&mut self, frame: &Frame, role: Role) -> Result<(Vec<u8>, Option<Frame>)> {
+        let key = role == Role::Key;
         if self.cfg.tools.palette {
             self.next_screen_content = looks_like_screen_content(frame);
         }
@@ -544,9 +723,12 @@ impl Encoder {
         let (src, stride) = self.source_planes(frame);
         let src = Arc::new(src);
         let tools = self.cfg.tools;
+        let golden = role == Role::Inter
+            && tools.multi_ref
+            && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
+        let boost = role != Role::Inter || golden;
+        let shown = !matches!(role, Role::AltRef { .. });
         // Rate control: the quantiser planned for this frame.
-        let golden = !key && tools.multi_ref && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
-        let boost = key || golden;
         let mut planned = None;
         if let Some(rc) = self.rc.as_mut() {
             let class = if key {
@@ -555,48 +737,59 @@ impl Encoder {
                 rc::Class::Inter
             };
             let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
-            let c = rc.measure(&src[0], stride[0], w, h);
+            let c = rc.measure(&src[0], stride[0], w, h, shown);
             planned = Some(rc.plan(class, c, |q| if boost { golden_boost(q) } else { 0 }));
         }
-        let (mut p, mut f, mut out) = self.code_tu(key, &src, &stride, planned.map(|x| x.qidx))?;
+        let (mut p, mut f, mut obus) =
+            self.code_tu(role, &src, &stride, planned.map(|x| x.qidx))?;
         if let (Some(pl), Some(rc)) = (planned.as_mut(), self.rc.as_mut())
-            && let Some(again) = rc.redo(pl, out.len() as u64 * 8, |q| {
+            && let Some(again) = rc.redo(pl, obus.len() as u64 * 8, |q| {
                 if boost { golden_boost(q) } else { 0 }
             })
         {
             // Far from the plan: planned again and coded again.
             *pl = again;
-            (p, f, out) = self.code_tu(key, &src, &stride, Some(pl.qidx))?;
+            (p, f, obus) = self.code_tu(role, &src, &stride, Some(pl.qidx))?;
         }
         self.dec.shown.clear();
         self.dec.finish_frame(f)?;
-        self.recon = self.dec.shown.pop();
-        if let Some(r) = self.recon.as_mut() {
+        let mut recon = self.dec.shown.pop();
+        if let Some(r) = recon.as_mut() {
             // What a decoder reports after this temporal unit's metadata.
             r.hdr = self.cfg.hdr;
         }
         // The reference slots now hold this frame.
         for i in 0..NUM_REF_FRAMES {
             if (p.refresh >> i) & 1 != 0 {
-                self.slot_frame[i] = self.frame_num;
+                self.slot_frame[i] = p.order_hint;
             }
         }
         if key {
             self.last_slot = 0;
             self.last2_slot = 1;
+            self.arf_slot = None;
+        } else if let Role::AltRef { .. } = role {
+            self.arf_slot = Some(p.refresh.trailing_zeros() as usize);
         } else if tools.multi_ref {
-            std::mem::swap(&mut self.last_slot, &mut self.last2_slot);
+            self.last2_slot = self.last_slot;
+            self.last_slot = (p.refresh & !(1 << GOLDEN_SLOT)).trailing_zeros() as usize;
         }
-        self.prev_src = Some(src.clone());
+        if shown {
+            self.prev_src = Some(src.clone());
+            self.shown += 1;
+            self.since_key = if key { 1 } else { self.since_key + 1 };
+        }
         self.frame_num += 1;
-        self.since_key = if key { 1 } else { self.since_key + 1 };
-        self.force_key = false;
-        self.last_key = key;
         if let (Some(pl), Some(rc)) = (planned.as_ref(), self.rc.as_mut()) {
-            rc.update(pl, out.len() as u64 * 8, !key && !golden);
+            rc.update(
+                pl,
+                obus.len() as u64 * 8,
+                role == Role::Inter && !golden,
+                shown,
+            );
             self.q = rc.base_q as f64;
         }
-        Ok(out)
+        Ok((obus, recon))
     }
 
     /// Codes one frame (both passes and the filter searches) into its
@@ -604,15 +797,14 @@ impl Encoder {
     /// committing it: the frame state comes back for `finish_frame`.
     fn code_tu(
         &mut self,
-        key: bool,
+        role: Role,
         src: &Arc<Vec<Vec<u16>>>,
         stride: &[usize],
         qidx: Option<u32>,
     ) -> Result<(FrameParams, crate::decoder::FrameCtx, Vec<u8>)> {
-        let seq = self.seq.clone();
         let tools = self.cfg.tools;
         let (src, stride) = (src.clone(), stride.to_vec());
-        let mut p = self.frame_params(key, qidx);
+        let mut p = self.frame_params(role, qidx);
         if tools.aq
             && let Some(prev) = self.prev_src.as_ref()
         {
@@ -710,18 +902,6 @@ impl Encoder {
         let Coded {
             f, header, tiles, ..
         } = coded;
-        // The temporal unit.
-        let mut out = Vec::new();
-        write_obu(&mut out, OBU_TEMPORAL_DELIMITER, &[]);
-        if key {
-            write_obu(&mut out, OBU_SEQUENCE_HEADER, &seq.write());
-            if let Some(c) = &self.cfg.hdr.content_light {
-                write_obu(&mut out, OBU_METADATA, &crate::obu::write_hdr_cll(c));
-            }
-            if let Some(m) = &self.cfg.hdr.mastering_display {
-                write_obu(&mut out, OBU_METADATA, &crate::obu::write_hdr_mdcv(m));
-            }
-        }
         let mut payload = header;
         let n = tiles.len();
         if n > 1 {
@@ -734,40 +914,65 @@ impl Encoder {
             }
             payload.extend_from_slice(t);
         }
+        let mut out = Vec::new();
         write_obu(&mut out, OBU_FRAME, &payload);
         Ok((p, f, out))
     }
 
     /// The header parameters of the next frame (before the in-loop filter
     /// search).
-    fn frame_params(&self, key: bool, planned_q: Option<u32>) -> FrameParams {
+    fn frame_params(&self, role: Role, planned_q: Option<u32>) -> FrameParams {
         let tools = self.cfg.tools;
+        let key = role == Role::Key;
+        let order_hint = match role {
+            Role::AltRef { ahead } => self.shown + ahead,
+            _ => self.shown,
+        };
         let mut qidx = planned_q.unwrap_or_else(|| self.quantizer());
         let mut refresh = 0xFFu8;
         let mut ref_slots = [0usize; REFS_PER_FRAME];
         let mut search_refs = Vec::new();
         if !key {
             if tools.multi_ref {
-                // This frame replaces the older of the two last frames;
-                // every GOLDEN_INTERVAL frames it is also the golden frame,
-                // coded finer.
-                let golden = self.since_key.is_multiple_of(GOLDEN_INTERVAL);
-                refresh = 1 << self.last2_slot;
-                if golden {
-                    refresh |= 1 << GOLDEN_SLOT;
+                // This frame replaces the oldest frame of the last ones
+                // (not LAST, nor the alt-ref frame waiting to be shown; an
+                // alt-ref frame not LAST2 either); every GOLDEN_INTERVAL
+                // frames a shown one is also the golden frame, coded finer.
+                let golden = role == Role::Inter && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
+                let pool: &[usize] = if self.altref_groups() {
+                    &[0, 1, 3, 4]
+                } else {
+                    &[0, 1]
+                };
+                let target = pool
+                    .iter()
+                    .copied()
+                    .filter(|&s| {
+                        s != self.last_slot
+                            && Some(s) != self.arf_slot
+                            && (role == Role::Inter || s != self.last2_slot)
+                    })
+                    .min_by_key(|&s| self.slot_frame[s])
+                    .expect("a slot to refresh");
+                refresh = 1 << target;
+                if golden || matches!(role, Role::AltRef { .. }) {
+                    if golden {
+                        refresh |= 1 << GOLDEN_SLOT;
+                    }
                     // (Rate control plans the boost in.)
                     if planned_q.is_none() {
                         qidx = qidx.saturating_sub(golden_boost(qidx)).max(1);
                     }
                 }
+                let back = self.arf_slot.unwrap_or(GOLDEN_SLOT);
                 ref_slots = [
                     self.last_slot,
                     self.last2_slot,
                     self.last2_slot,
                     GOLDEN_SLOT,
-                    GOLDEN_SLOT,
-                    GOLDEN_SLOT,
-                    GOLDEN_SLOT,
+                    back,
+                    back,
+                    back,
                 ];
                 search_refs.push(LAST_FRAME);
                 let lf = self.slot_frame[self.last_slot];
@@ -778,6 +983,12 @@ impl Encoder {
                 }
                 if g != lf && g != l2 {
                     search_refs.push(GOLDEN_FRAME);
+                }
+                if let Some(a) = self.arf_slot {
+                    let a = self.slot_frame[a];
+                    if a != lf && a != l2 && a != g {
+                        search_refs.push(ALTREF_FRAME);
+                    }
                 }
             } else {
                 refresh = 1;
@@ -816,6 +1027,8 @@ impl Encoder {
             reduced_tx_set: !(tools.full_tx_set && tools.rdo),
             tile_cols_log2: self.cfg.tile_cols_log2,
             aq: None,
+            show: !matches!(role, Role::AltRef { .. }),
+            order_hint,
         }
     }
 
@@ -987,7 +1200,10 @@ impl Encoder {
         let mut w = BitWriter::new();
         w.flag(false); // show_existing_frame
         w.f(2, if key { KEY_FRAME } else { INTER_FRAME });
-        w.flag(true); // show_frame
+        w.flag(p.show); // show_frame
+        if !p.show {
+            w.flag(true); // showable_frame
+        }
         if !key {
             w.flag(false); // error_resilient_mode
         }
@@ -1001,7 +1217,7 @@ impl Encoder {
         w.flag(false); // frame_size_override_flag
         w.f(
             seq.order_hint_bits,
-            (self.frame_num & ((1 << seq.order_hint_bits) - 1)) as u32,
+            (p.order_hint & ((1 << seq.order_hint_bits) - 1)) as u32,
         );
         if !key {
             w.f(3, 0); // primary_ref_frame: LAST_FRAME
@@ -1142,7 +1358,7 @@ impl Encoder {
     /// backward one or a second, older forward one.
     fn skip_mode_allowed(&self, p: &FrameParams) -> bool {
         let seq = &self.seq;
-        let hint = (self.frame_num & ((1 << seq.order_hint_bits) - 1)) as u32;
+        let hint = (p.order_hint & ((1 << seq.order_hint_bits) - 1)) as u32;
         let dist = |a: u32, b: u32| crate::header::get_relative_dist(seq, a, b);
         let hints: Vec<u32> = p
             .ref_slots

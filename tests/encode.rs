@@ -261,6 +261,51 @@ fn tiles() {
 /// chroma from luma) on a small natural crop, and palettes on a frame of
 /// few colours: decoded to the reconstruction. Cheap enough for the
 /// overflow-checked run.
+/// Hidden alt-ref groups: the encoder holds frames, then hands out one
+/// temporal unit per frame in order (the first of each group carrying the
+/// hidden alt-ref frame, the last a `show_existing_frame`), each decoding
+/// to the reconstruction it reports; key frames forced or by the interval
+/// cut the groups.
+#[test]
+fn alt_ref_groups_round_trip() {
+    let src = natural(13);
+    let mut cfg = cfg_for(src[0].width, src[0].height);
+    cfg.altref = 4;
+    cfg.tools.multi_ref = true;
+    cfg.keyframe_interval = 9;
+    cfg.quantizer = 100;
+    let mut enc = Encoder::new(cfg);
+    let mut dec = Decoder::new();
+    dec.set_strict(true);
+    let mut shown = 0;
+    let mut check = |tu: Vec<u8>, enc: &Encoder| {
+        let d = dec.decode(&tu).unwrap().expect("a shown frame per unit");
+        assert_eq!(&d, enc.reconstruction().unwrap(), "frame {shown}");
+        assert!(
+            psnr(&src[shown], &d, 0) > 28.0,
+            "frame {shown} shown in order"
+        );
+        shown += 1;
+    };
+    let mut held = 0;
+    for (i, f) in src.iter().enumerate() {
+        if i == 11 {
+            enc.force_keyframe();
+        }
+        let tu = enc.encode(f).unwrap();
+        if tu.is_empty() {
+            held += 1;
+        } else {
+            check(tu, &enc);
+        }
+    }
+    while let Some(tu) = enc.flush().unwrap() {
+        check(tu, &enc);
+    }
+    assert_eq!(shown, src.len());
+    assert!(held > 0, "the encoder held frames for its groups");
+}
+
 #[test]
 fn every_tool_round_trips() {
     let src = natural(4);

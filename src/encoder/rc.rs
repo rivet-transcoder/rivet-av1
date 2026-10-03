@@ -153,9 +153,17 @@ impl RateControl {
     }
 
     /// Measures the source's complexity (luma `y`, `stride`, `w` x `h`, at
-    /// the configured bit depth) and keeps its half-size luma for the next
-    /// frame's.
-    pub(crate) fn measure(&mut self, y: &[u16], stride: usize, w: usize, h: usize) -> Complexity {
+    /// the configured bit depth) and, for a frame shown in its turn
+    /// (`keep`; not an alt-ref frame coded ahead), keeps its half-size luma
+    /// for the next frame's.
+    pub(crate) fn measure(
+        &mut self,
+        y: &[u16],
+        stride: usize,
+        w: usize,
+        h: usize,
+        keep: bool,
+    ) -> Complexity {
         let shift = self.bit_depth - 8;
         let (hw, hh) = (w / 2, h / 2);
         let mut half = vec![0u16; hw * hh];
@@ -202,7 +210,9 @@ impl RateControl {
                 n += 64;
             }
         }
-        self.prev = Some(half);
+        if keep {
+            self.prev = Some(half);
+        }
         let n = n.max(1) as f64;
         Complexity {
             intra: intra_t / n,
@@ -343,13 +353,20 @@ impl RateControl {
         }
     }
 
-    /// Accounts for a coded frame; `plain` an inter frame at the plan's
-    /// quantiser (not a golden frame).
-    pub(crate) fn update(&mut self, p: &Planned, bits: u64, plain: bool) {
-        self.refit(p, bits, false);
+    /// Accounts for a temporal unit that shows a frame coded earlier.
+    pub(crate) fn account_shown(&mut self, bits: u64) {
         self.spent += bits as f64;
         self.frames += 1;
-        if p.class == Class::Inter {
+    }
+
+    /// Accounts for a coded frame; `plain` an inter frame at the plan's
+    /// quantiser (not a golden or alt-ref frame), `shown` whether it is
+    /// shown now (an alt-ref frame is shown later).
+    pub(crate) fn update(&mut self, p: &Planned, bits: u64, plain: bool, shown: bool) {
+        self.refit(p, bits, false);
+        self.spent += bits as f64;
+        self.frames += shown as u64;
+        if p.class == Class::Inter && shown {
             self.inter_complexity = Some(p.c.inter);
         }
         if plain {
