@@ -45,7 +45,7 @@ pub(crate) mod symbol;
 #[rustfmt::skip]
 pub(crate) mod tables;
 
-pub use decoder::Decoder;
+pub use decoder::{annexb_temporal_units, Decoder};
 pub use frame::{ChromaFormat, ColorInfo, Frame, Plane};
 
 /// Errors the decoder and encoder can report.

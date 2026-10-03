@@ -127,7 +127,9 @@ pub(crate) struct SequenceHeader {
 }
 
 impl SequenceHeader {
-    pub(crate) fn parse(data: &[u8]) -> Result<Self> {
+    /// Parses a sequence header, choosing operating point `op` (clamped to
+    /// the ones the header declares).
+    pub(crate) fn parse(data: &[u8], op: usize) -> Result<Self> {
         let mut r = BitReader::new(data);
         let seq_profile = r.f(3)?;
         if seq_profile > 2 {
@@ -192,8 +194,8 @@ impl SequenceHeader {
                 }
             }
         }
-        // choose_operating_point(): operating point 0.
-        let op_idc = operating_point_idc[0];
+        // choose_operating_point()
+        let op_idc = operating_point_idc[op.min(operating_points_cnt_minus_1)];
         let frame_width_bits = r.f(4)? + 1;
         let frame_height_bits = r.f(4)? + 1;
         let max_frame_width = r.f(frame_width_bits)? + 1;

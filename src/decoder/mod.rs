@@ -114,6 +114,7 @@ pub struct Decoder {
     seen_frame_header: bool,
     shown: Vec<Frame>,
     strict: bool,
+    operating_point: usize,
 }
 
 impl Default for Decoder {
@@ -133,6 +134,7 @@ impl Decoder {
             seen_frame_header: false,
             shown: Vec::new(),
             strict: false,
+            operating_point: 0,
         }
     }
 
@@ -141,6 +143,36 @@ impl Decoder {
     /// A conformance check; off by default.
     pub fn set_strict(&mut self, strict: bool) {
         self.strict = strict;
+    }
+
+    /// Chooses the operating point (`choose_operating_point()`, 5.5.1):
+    /// which layers of a scalable stream to decode. 0, the default, is the
+    /// one the stream lists first (normally all layers).
+    pub fn set_operating_point(&mut self, op: usize) {
+        self.operating_point = op;
+    }
+
+    /// Decodes a temporal unit in the length-delimited format of Annex B
+    /// (without its leading `temporal_unit_size`; see
+    /// [`annexb_temporal_units`]) and returns every frame it shows.
+    pub fn decode_annexb(&mut self, tu: &[u8]) -> Result<Vec<Frame>> {
+        self.shown.clear();
+        let mut pos = 0;
+        while pos < tu.len() {
+            let (fu_size, n) = read_leb128(&tu[pos..])?;
+            pos += n;
+            let end = pos.checked_add(fu_size).filter(|&e| e <= tu.len()).ok_or_else(|| Error::bitstream("frame_unit_size runs past the temporal unit"))?;
+            while pos < end {
+                let (obu_len, n) = read_leb128(&tu[pos..end])?;
+                pos += n;
+                let obu_end = pos.checked_add(obu_len).filter(|&e| e <= end).ok_or_else(|| Error::bitstream("obu_length runs past the frame unit"))?;
+                for obu in split_obus(&tu[pos..obu_end])? {
+                    self.decode_obu(obu.obu_type, obu.temporal_id, obu.spatial_id, obu.has_extension, obu.payload)?;
+                }
+                pos = obu_end;
+            }
+        }
+        Ok(std::mem::take(&mut self.shown))
     }
 
     /// Decodes one temporal unit (or any sequence of whole OBUs) and
@@ -174,7 +206,7 @@ impl Decoder {
         }
         match obu_type {
             OBU_SEQUENCE_HEADER => {
-                let s = SequenceHeader::parse(payload)?;
+                let s = SequenceHeader::parse(payload, self.operating_point)?;
                 self.seq = Some(Arc::new(s));
             }
             OBU_TEMPORAL_DELIMITER => {
@@ -685,6 +717,34 @@ impl Decoder {
         }
         (refs, mvs)
     }
+}
+
+/// `leb128()` at the start of `d`: the value and its length in bytes.
+fn read_leb128(d: &[u8]) -> Result<(usize, usize)> {
+    let mut value: u64 = 0;
+    for i in 0..8 {
+        let b = *d.get(i).ok_or_else(|| Error::bitstream("leb128 runs past the data"))? as u64;
+        value |= (b & 0x7f) << (i * 7);
+        if b & 0x80 == 0 {
+            return Ok((value as usize, i + 1));
+        }
+    }
+    Ok((value as usize, 8))
+}
+
+/// Splits a whole Annex B bitstream (5.2's length-delimited format) into
+/// its temporal units, each without its `temporal_unit_size`.
+pub fn annexb_temporal_units(data: &[u8]) -> Result<Vec<&[u8]>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (sz, n) = read_leb128(&data[pos..])?;
+        pos += n;
+        let end = pos.checked_add(sz).filter(|&e| e <= data.len()).ok_or_else(|| Error::bitstream("temporal_unit_size runs past the data"))?;
+        out.push(&data[pos..end]);
+        pos = end;
+    }
+    Ok(out)
 }
 
 /// The get MV projection process (7.9.3).
