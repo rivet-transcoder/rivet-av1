@@ -6,7 +6,9 @@
 //! tool" page) is not downloaded by the tests: set `ARGON_DIR` to its
 //! unpacked `argon_coveragetool_av1_base_and_extended_profiles_v2.1`
 //! directory. `ARGON_FILTER=substr` restricts the run to matching paths;
-//! `ARGON_REPORT=file` writes one line per stream. Without `ARGON_DIR`
+//! `ARGON_REPORT=file` writes one line per stream; `ARGON_LAYERS=1` adds
+//! the per-operating-point (`layers/N`) variants; `ARGON_VERBOSE=1` prints
+//! each result as it comes. Without `ARGON_DIR`
 //! the test reports that it skipped.
 //!
 //! Each stream's `ref_cmd` script gives the options the reference output
@@ -86,7 +88,8 @@ fn cases(root: &Path) -> Vec<Case> {
                 push(p, cmd_dir.join(format!("{stem}.sh")), label);
             }
         }
-        if let Ok(rd) = std::fs::read_dir(md5_dir.join("layers")) {
+        let layers = std::env::var("ARGON_LAYERS").is_ok();
+        if let Ok(rd) = std::fs::read_dir(md5_dir.join("layers")).map_err(|_| ()).and_then(|r| if layers { Ok(r) } else { Err(()) }) {
             let mut layers: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
             layers.sort();
             for l in layers {
