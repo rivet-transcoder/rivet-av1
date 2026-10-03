@@ -236,6 +236,22 @@ fn forced_key_frames() {
     );
 }
 
+/// Several tile columns (asked for, and forced by a frame wider than
+/// 4096): every tile decodes to the reconstruction.
+#[test]
+fn tiles() {
+    let frames: Vec<Frame> = (0..3).map(|t| synthetic(256, 64, t, 8)).collect();
+    let mut cfg = cfg_for(256, 64);
+    cfg.tile_cols_log2 = 2;
+    let (dec, sizes) = round_trip(cfg, &frames);
+    assert!(psnr(&frames[1], &dec[1], 0) > 30.0, "{sizes:?}");
+    let frames: Vec<Frame> = (0..2).map(|t| synthetic(4104, 8, t, 8)).collect();
+    let mut cfg = cfg_for(4104, 8);
+    cfg.speed = 8;
+    cfg.tools = av1::Tools::for_speed(8);
+    round_trip(cfg, &frames);
+}
+
 #[test]
 fn natural_video_quality_tracks_the_quantiser() {
     let src = natural(6);

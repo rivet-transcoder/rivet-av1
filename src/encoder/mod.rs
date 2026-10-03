@@ -1,4 +1,4 @@
-//! The AV1 encoder: key frames and inter frames, one tile per frame.
+//! The AV1 encoder: key frames and inter frames.
 //!
 //! Each frame is coded by the decoder's own tile walker running in encode
 //! mode (see `encoder::tile`): the encoder plants its decisions — the
@@ -9,12 +9,12 @@
 //! two cannot disagree; the in-loop filters and the reference update are
 //! the decoder's.
 //!
-//! What it uses: 64x64 superblocks split down to 8x8 (and 4x4 at frame
-//! edges); intra DC, V, H, smooth, Paeth and two directional modes; inter
-//! prediction from the previous frame with NEWMV (full-pel search and
-//! quarter-sample refinement), NEARESTMV and GLOBALMV; DCT; a fixed
-//! quantiser per frame or simple rate control; the loop filter.
+//! Decisions are searched by trial coding (`encoder::rdo`); the in-loop
+//! filters' parameters (loop filter levels, CDEF strengths) are searched on
+//! a first pass's reconstruction, and the frame is then coded again
+//! replaying the first pass's decisions with them.
 
+pub(crate) mod cdef;
 pub(crate) mod fwd;
 pub(crate) mod rdo;
 pub(crate) mod tile;
@@ -106,6 +106,16 @@ pub struct Tools {
     pub intra_candidates: u8,
     /// Inter modes / vectors trialled per block.
     pub inter_candidates: u8,
+    /// CDEF: strengths searched per frame, an index per 64x64 block.
+    pub cdef: bool,
+    /// The CDEF search tries more strengths.
+    pub cdef_thorough: bool,
+    /// Loop filter levels searched per frame (else derived from the
+    /// quantiser).
+    pub lf_search: bool,
+    /// Several references: the last two frames and a golden frame (the
+    /// key frame, then every 16th frame, coded finer).
+    pub multi_ref: bool,
 }
 
 impl Tools {
@@ -139,6 +149,10 @@ impl Tools {
                 5..=6 => 2,
                 _ => 1,
             },
+            cdef: s <= 8,
+            cdef_thorough: s <= 3,
+            lf_search: s <= 8,
+            multi_ref: s <= 6,
         }
     }
 
@@ -158,6 +172,10 @@ impl Tools {
             "full_tx_set" => self.full_tx_set = b,
             "intra_candidates" => self.intra_candidates = value.min(13) as u8,
             "inter_candidates" => self.inter_candidates = value.min(16) as u8,
+            "cdef" => self.cdef = b,
+            "cdef_thorough" => self.cdef_thorough = b,
+            "lf_search" => self.lf_search = b,
+            "multi_ref" => self.multi_ref = b,
             _ => return false,
         }
         true
@@ -202,6 +220,49 @@ pub struct Encoder {
     last_key: bool,
     q: f64,
     recon: Option<Frame>,
+    /// The frame number each reference slot holds.
+    slot_frame: [u64; NUM_REF_FRAMES],
+    /// The slots of `LAST_FRAME` and `LAST2_FRAME`.
+    last_slot: usize,
+    last2_slot: usize,
+}
+
+/// The slot the golden frame (the key frame, or a periodic boosted frame)
+/// lives in when several references are used.
+const GOLDEN_SLOT: usize = 2;
+
+/// What one frame's header says, as the encoder chooses it.
+#[derive(Clone, Debug)]
+struct FrameParams {
+    key: bool,
+    qidx: u32,
+    refresh: u8,
+    /// `ref_frame_idx[ LAST_FRAME..ALTREF_FRAME ]`.
+    ref_slots: [usize; REFS_PER_FRAME],
+    /// The references inter prediction may search (distinct frames).
+    search_refs: Vec<i32>,
+    /// `loop_filter_level[ 0..4 ]`.
+    lf: [u32; 4],
+    cdef: Option<cdef::CdefParams>,
+    tx_select: bool,
+    reduced_tx_set: bool,
+    tile_cols_log2: u32,
+}
+
+/// What a second coding pass replays.
+struct Replay {
+    /// The first pass's decision log, per tile.
+    logs: Vec<Vec<rdo::Decision>>,
+    /// Each 64x64 block's CDEF index.
+    cdef: Option<Vec<i8>>,
+}
+
+/// The coded frame: its state for the in-loop filters, and its tiles.
+struct Coded {
+    f: crate::decoder::FrameCtx,
+    header: Vec<u8>,
+    tiles: Vec<Vec<u8>>,
+    logs: Vec<Vec<rdo::Decision>>,
 }
 
 impl Encoder {
@@ -245,7 +306,7 @@ impl Encoder {
             seq_force_integer_mv: SELECT_INTEGER_MV,
             order_hint_bits: 7,
             enable_superres: false,
-            enable_cdef: false,
+            enable_cdef: cfg.tools.cdef,
             enable_restoration: false,
             color: ColorConfig {
                 bit_depth: cfg.bit_depth,
@@ -276,6 +337,9 @@ impl Encoder {
             last_key: false,
             q,
             recon: None,
+            slot_frame: [0; NUM_REF_FRAMES],
+            last_slot: 0,
+            last2_slot: 1,
         }
     }
 
@@ -316,7 +380,7 @@ impl Encoder {
     }
 
     /// Encodes one frame and returns its temporal unit (temporal delimiter,
-    /// sequence header on key frames, frame OBU).
+    /// sequence header and metadata on key frames, frame OBU).
     pub fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>> {
         let cfg = &self.cfg;
         if frame.width != cfg.width || frame.height != cfg.height {
@@ -332,32 +396,42 @@ impl Encoder {
         }
         check_color(&cfg.color)?;
         let key = self.next_is_keyframe();
-        let qidx = self.quantizer();
-        let header = self.write_frame_header(key, qidx);
-        // Parse it back with the decoder's parser: the frame state is then
-        // exactly what a decoder will set up.
+        let mut p = self.frame_params(key);
         let seq = self.seq.clone();
         if self.dec.seq.is_none() || key {
             self.dec.seq = Some(seq.clone());
         }
-        let mut r = BitReader::new(&header);
-        let hdr = FrameHeader::parse(&mut r, &seq, &mut self.dec.ref_state, 0, 0)?;
-        let mut f = self.dec.setup_frame(seq.clone(), hdr)?;
-        let enc = self.enc_ctx(&f, frame, key, qidx);
-        let (tile, saved) = {
-            let mut td = TileDecoder::new_encoder(&mut f, enc, 0, 0);
-            td.decode_tile()?;
-            let saved = if !td.f.hdr.disable_frame_end_update_cdf {
-                Some(td.cdf.clone())
-            } else {
-                None
+        let (src, stride) = self.source_planes(frame);
+        let tools = self.cfg.tools;
+        let mut coded = self.code_frame(&p, &src, &stride, None)?;
+        if tools.lf_search || tools.cdef {
+            // The in-loop filters' parameters, chosen on the first pass's
+            // reconstruction; then the frame again with them, replaying the
+            // first pass's decisions.
+            let mut f = coded.f;
+            if tools.lf_search && self.cfg.loop_filter.is_none() {
+                p.lf = search_lf(&mut f, &src, &stride, p.lf);
+            }
+            f.hdr.loop_filter_level = p.lf.map(|l| l as i32);
+            if p.lf[0] != 0 || p.lf[1] != 0 {
+                crate::decoder::postfilter::loop_filter(&mut f);
+            }
+            let mut cdef_table = None;
+            if tools.cdef {
+                let lambda = rd_lambda(&self.cfg, p.qidx);
+                let (params, table) = cdef::search(&f, &src, &stride, lambda, tools.cdef_thorough);
+                p.cdef = Some(params);
+                cdef_table = Some(table);
+            }
+            let replay = Replay {
+                logs: std::mem::take(&mut coded.logs),
+                cdef: cdef_table,
             };
-            let crate::symbol::Coder::Enc(e) = td.sd else {
-                unreachable!("encode mode")
-            };
-            (e.finish(), saved)
-        };
-        f.saved_cdfs = saved;
+            coded = self.code_frame(&p, &src, &stride, Some(replay))?;
+        }
+        let Coded {
+            f, header, tiles, ..
+        } = coded;
         self.dec.shown.clear();
         self.dec.finish_frame(f)?;
         self.recon = self.dec.shown.pop();
@@ -378,14 +452,188 @@ impl Encoder {
             }
         }
         let mut payload = header;
-        payload.extend_from_slice(&tile);
+        let n = tiles.len();
+        if n > 1 {
+            // tile_start_and_end_present_flag = 0, then byte alignment.
+            payload.push(0);
+        }
+        for (i, t) in tiles.iter().enumerate() {
+            if i + 1 < n {
+                payload.extend_from_slice(&((t.len() - 1) as u32).to_le_bytes());
+            }
+            payload.extend_from_slice(t);
+        }
         write_obu(&mut out, OBU_FRAME, &payload);
+        // The reference slots now hold this frame.
+        for i in 0..NUM_REF_FRAMES {
+            if (p.refresh >> i) & 1 != 0 {
+                self.slot_frame[i] = self.frame_num;
+            }
+        }
+        if key {
+            self.last_slot = 0;
+            self.last2_slot = 1;
+        } else if tools.multi_ref {
+            std::mem::swap(&mut self.last_slot, &mut self.last2_slot);
+        }
         self.frame_num += 1;
         self.since_key = if key { 1 } else { self.since_key + 1 };
         self.force_key = false;
         self.last_key = key;
         self.rate_control(out.len() as u64 * 8, key);
         Ok(out)
+    }
+
+    /// The header parameters of the next frame (before the in-loop filter
+    /// search).
+    fn frame_params(&self, key: bool) -> FrameParams {
+        let tools = self.cfg.tools;
+        let mut qidx = self.quantizer();
+        let mut refresh = 0xFFu8;
+        let mut ref_slots = [0usize; REFS_PER_FRAME];
+        let mut search_refs = Vec::new();
+        if !key {
+            if tools.multi_ref {
+                // This frame replaces the older of the two last frames;
+                // every GOLDEN_INTERVAL frames it is also the golden frame,
+                // coded finer.
+                let golden = self.since_key.is_multiple_of(GOLDEN_INTERVAL);
+                refresh = 1 << self.last2_slot;
+                if golden {
+                    refresh |= 1 << GOLDEN_SLOT;
+                    qidx = qidx.saturating_sub(golden_boost(qidx)).max(1);
+                }
+                ref_slots = [
+                    self.last_slot,
+                    self.last2_slot,
+                    self.last2_slot,
+                    GOLDEN_SLOT,
+                    GOLDEN_SLOT,
+                    GOLDEN_SLOT,
+                    GOLDEN_SLOT,
+                ];
+                search_refs.push(LAST_FRAME);
+                let lf = self.slot_frame[self.last_slot];
+                let l2 = self.slot_frame[self.last2_slot];
+                let g = self.slot_frame[GOLDEN_SLOT];
+                if l2 != lf {
+                    search_refs.push(LAST2_FRAME);
+                }
+                if g != lf && g != l2 {
+                    search_refs.push(GOLDEN_FRAME);
+                }
+            } else {
+                refresh = 1;
+                search_refs.push(LAST_FRAME);
+            }
+        }
+        let lf = self
+            .cfg
+            .loop_filter
+            .unwrap_or_else(|| ((qidx as f64) * 0.18 + 2.0).min(40.0) as u32);
+        let chroma_lf = if lf != 0 { lf / 2 + 1 } else { 0 };
+        FrameParams {
+            key,
+            qidx,
+            refresh,
+            ref_slots,
+            search_refs,
+            lf: [lf, lf, chroma_lf, chroma_lf],
+            cdef: if tools.cdef {
+                Some(cdef::CdefParams::off())
+            } else {
+                None
+            },
+            tx_select: tools.tx_size && tools.rdo,
+            reduced_tx_set: !(tools.full_tx_set && tools.rdo),
+            tile_cols_log2: self.cfg.tile_cols_log2,
+        }
+    }
+
+    /// The source planes, padded to the frame buffers' size by repeating
+    /// the last column and row.
+    fn source_planes(&self, frame: &Frame) -> (Vec<Vec<u16>>, Vec<usize>) {
+        let mi_cols = 2 * ((self.cfg.width as usize + 7) >> 3);
+        let mi_rows = 2 * ((self.cfg.height as usize + 7) >> 3);
+        let aw = (mi_cols * MI_SIZE + 127) & !127;
+        let ah = (mi_rows * MI_SIZE + 127) & !127;
+        let mut src = Vec::new();
+        let mut stride = Vec::new();
+        for p in 0..3 {
+            let (sw, sh) = if p == 0 {
+                (aw + 32, ah + 32)
+            } else {
+                ((aw >> 1) + 32, (ah >> 1) + 32)
+            };
+            let pl = frame.planes[p];
+            let (w, h) = (pl.width as usize, pl.height as usize);
+            let mut v = vec![0u16; sw * sh];
+            for y in 0..sh {
+                let sy = y.min(h - 1);
+                let row = &mut v[y * sw..(y + 1) * sw];
+                for (x, o) in row.iter_mut().enumerate() {
+                    *o = frame.sample(p, x.min(w - 1) as u32, sy as u32);
+                }
+            }
+            src.push(v);
+            stride.push(sw);
+        }
+        (src, stride)
+    }
+
+    /// Writes the header for `p`, parses it back with the decoder's parser
+    /// (the frame state is then exactly what a decoder sets up) and codes
+    /// every tile: searching, or replaying an earlier pass.
+    fn code_frame(
+        &mut self,
+        p: &FrameParams,
+        src: &[Vec<u16>],
+        stride: &[usize],
+        replay: Option<Replay>,
+    ) -> Result<Coded> {
+        let header = self.write_frame_header(p);
+        let seq = self.seq.clone();
+        let mut r = BitReader::new(&header);
+        let hdr = FrameHeader::parse(&mut r, &seq, &mut self.dec.ref_state, 0, 0)?;
+        let mut f = self.dec.setup_frame(seq, hdr)?;
+        let ti = f.hdr.tile_info.clone();
+        let num_tiles = ti.cols * ti.rows;
+        let mut tiles = Vec::with_capacity(num_tiles);
+        let mut logs = Vec::with_capacity(num_tiles);
+        let mut replay = replay;
+        for t in 0..num_tiles {
+            let mut enc = self.enc_ctx(p, src, stride);
+            if let Some(rp) = replay.as_mut() {
+                enc.rdo.replay = std::mem::take(&mut rp.logs[t]).into();
+                enc.cdef_table = rp.cdef.clone();
+            }
+            let (bytes, log, saved) = {
+                let mut td = TileDecoder::new_encoder(&mut f, enc, t / ti.cols, t % ti.cols);
+                td.decode_tile()?;
+                let saved =
+                    if !td.f.hdr.disable_frame_end_update_cdf && t == ti.context_update_tile_id {
+                        Some(td.cdf.clone())
+                    } else {
+                        None
+                    };
+                let log = std::mem::take(&mut td.enc.as_mut().expect("encode mode").rdo.log);
+                let crate::symbol::Coder::Enc(e) = td.sd else {
+                    unreachable!("encode mode")
+                };
+                (e.finish(), log, saved)
+            };
+            if saved.is_some() {
+                f.saved_cdfs = saved;
+            }
+            tiles.push(bytes);
+            logs.push(log);
+        }
+        Ok(Coded {
+            f,
+            header,
+            tiles,
+            logs,
+        })
     }
 
     fn rate_control(&mut self, bits: u64, key: bool) {
@@ -398,52 +646,31 @@ impl Encoder {
         self.q = (self.q + 12.0 * ratio.clamp(-2.0, 2.0)).clamp(1.0, 255.0);
     }
 
-    fn enc_ctx(
-        &self,
-        f: &crate::decoder::FrameCtx,
-        frame: &Frame,
-        key: bool,
-        qidx: u32,
-    ) -> Box<tile::EncCtx> {
-        let mut src = Vec::new();
-        let mut stride = Vec::new();
-        for p in 0..3 {
-            let cur = &f.cur.planes[p];
-            let pl = frame.planes[p];
-            let (w, h) = (pl.width as usize, pl.height as usize);
-            let mut v = vec![0u16; cur.stride * cur.h];
-            for y in 0..cur.h {
-                let sy = y.min(h - 1);
-                for x in 0..cur.stride {
-                    let sx = x.min(w - 1);
-                    v[y * cur.stride + x] = frame.sample(p, sx as u32, sy as u32);
-                }
-            }
-            src.push(v);
-            stride.push(cur.stride);
-        }
+    fn enc_ctx(&self, p: &FrameParams, src: &[Vec<u16>], stride: &[usize]) -> Box<tile::EncCtx> {
         let bdi = ((self.cfg.bit_depth - 8) >> 1) as usize;
-        let qstep = AC_QLOOKUP[bdi][qidx as usize] as f64 / (1 << (self.cfg.bit_depth - 8)) as f64;
+        let qstep =
+            AC_QLOOKUP[bdi][p.qidx as usize] as f64 / (1 << (self.cfg.bit_depth - 8)) as f64;
         let scale = (1 << (self.cfg.bit_depth - 8)) as f64;
-        let step = qstep * scale / 8.0;
         Box::new(tile::EncCtx {
-            src,
-            stride,
+            src: src.to_vec(),
+            stride: stride.to_vec(),
             coefs: Box::new([0; 1024]),
             lambda: 0.4 * qstep * scale,
-            rd_lambda: rd_lambda_factor() * step * step,
-            refs: if key { Vec::new() } else { vec![LAST_FRAME] },
+            rd_lambda: rd_lambda(&self.cfg, p.qidx),
+            refs: p.search_refs.clone(),
             search_range: self.cfg.search_range,
             tools: self.cfg.tools,
             rdo: Default::default(),
             res: Vec::new(),
             fc: Vec::new(),
+            cdef_table: None,
         })
     }
 
     /// `uncompressed_header()` for the encoder's frames, byte aligned.
-    fn write_frame_header(&self, key: bool, qidx: u32) -> Vec<u8> {
+    fn write_frame_header(&self, p: &FrameParams) -> Vec<u8> {
         let seq = &self.seq;
+        let key = p.key;
         let mut w = BitWriter::new();
         w.flag(false); // show_existing_frame
         w.f(2, if key { KEY_FRAME } else { INTER_FRAME });
@@ -459,11 +686,11 @@ impl Encoder {
             (self.frame_num & ((1 << seq.order_hint_bits) - 1)) as u32,
         );
         if !key {
-            w.f(3, 0); // primary_ref_frame: LAST_FRAME's slot
-            w.f(8, 1); // refresh_frame_flags: slot 0
+            w.f(3, 0); // primary_ref_frame: LAST_FRAME
+            w.f(8, p.refresh as u32); // refresh_frame_flags
             w.flag(false); // frame_refs_short_signaling
-            for _ in 0..REFS_PER_FRAME {
-                w.f(3, 0); // ref_frame_idx
+            for &s in &p.ref_slots {
+                w.f(3, s as u32); // ref_frame_idx
             }
             // frame_size_with_refs() is not used (no override): frame_size()
             // has nothing to write, then render_size().
@@ -476,7 +703,8 @@ impl Encoder {
             w.flag(false); // render_and_frame_size_different
         }
         w.flag(false); // disable_frame_end_update_cdf
-        // tile_info(): uniform, one tile column and row when possible.
+        // tile_info(): uniform spacing, the tile columns asked for (at
+        // least as many as the frame needs).
         let mi_cols = 2 * ((self.cfg.width + 7) >> 3);
         let mi_rows = 2 * ((self.cfg.height + 7) >> 3);
         let sb_cols = (mi_cols + 15) >> 4;
@@ -485,17 +713,25 @@ impl Encoder {
         let min_cols = tl(MAX_TILE_WIDTH >> 6, sb_cols);
         let max_cols = tl(1, sb_cols.min(MAX_TILE_COLS));
         let max_rows = tl(1, sb_rows.min(MAX_TILE_ROWS));
+        let cols_log2 = p.tile_cols_log2.clamp(min_cols, max_cols);
         w.flag(true); // uniform_tile_spacing_flag
-        if min_cols < max_cols {
+        for _ in min_cols..cols_log2 {
+            w.flag(true); // increment_tile_cols_log2
+        }
+        if cols_log2 < max_cols {
             w.flag(false);
         }
         let min_tiles = min_cols.max(tl(MAX_TILE_AREA >> 12, sb_rows * sb_cols));
-        let min_rows = min_tiles.saturating_sub(min_cols);
+        let min_rows = min_tiles.saturating_sub(cols_log2);
         if min_rows < max_rows {
-            w.flag(false);
+            w.flag(false); // increment_tile_rows_log2
+        }
+        if cols_log2 + min_rows > 0 {
+            w.f(cols_log2 + min_rows, 0); // context_update_tile_id
+            w.f(2, 3); // tile_size_bytes_minus_1
         }
         // quantization_params()
-        w.f(8, qidx);
+        w.f(8, p.qidx);
         w.flag(false); // DeltaQYDc
         w.flag(false); // DeltaQUDc
         w.flag(false); // DeltaQUAc
@@ -503,25 +739,32 @@ impl Encoder {
         w.flag(false); // segmentation_enabled
         w.flag(false); // delta_q_present
         // loop_filter_params()
-        let lf = self
-            .cfg
-            .loop_filter
-            .unwrap_or_else(|| ((qidx as f64) * 0.18 + 2.0).min(40.0) as u32);
-        w.f(6, lf);
-        w.f(6, lf);
-        if lf != 0 {
-            w.f(6, lf / 2 + 1);
-            w.f(6, lf / 2 + 1);
+        w.f(6, p.lf[0]);
+        w.f(6, p.lf[1]);
+        if p.lf[0] != 0 || p.lf[1] != 0 {
+            w.f(6, p.lf[2]);
+            w.f(6, p.lf[3]);
         }
         w.f(3, 0); // loop_filter_sharpness
         w.flag(false); // loop_filter_delta_enabled
+        // cdef_params()
+        if let Some(c) = &p.cdef {
+            w.f(2, c.damping_minus_3);
+            w.f(2, c.bits);
+            for i in 0..1usize << c.bits {
+                w.f(4, c.y[i].0);
+                w.f(2, c.y[i].1);
+                w.f(4, c.uv[i].0);
+                w.f(2, c.uv[i].1);
+            }
+        }
         // read_tx_mode(): TX_MODE_SELECT when transform sizes are searched.
-        w.flag(self.cfg.tools.tx_size && self.cfg.tools.rdo);
+        w.flag(p.tx_select);
         if !key {
             w.flag(false); // reference_select
             // skip_mode not allowed without reference_select.
         }
-        w.flag(!(self.cfg.tools.full_tx_set && self.cfg.tools.rdo)); // reduced_tx_set
+        w.flag(p.reduced_tx_set); // reduced_tx_set
         if !key {
             for _ in LAST_FRAME..=ALTREF_FRAME {
                 w.flag(false); // is_global
@@ -530,6 +773,75 @@ impl Encoder {
         w.byte_align();
         w.finish()
     }
+}
+
+/// How often a boosted golden frame is coded with several references.
+const GOLDEN_INTERVAL: u64 = 16;
+
+/// How much finer the golden frame's quantiser is.
+fn golden_boost(qidx: u32) -> u32 {
+    (qidx / 6).clamp(4, 24)
+}
+
+/// The rate-distortion Lagrange multiplier at quantiser `qidx`.
+fn rd_lambda(cfg: &Config, qidx: u32) -> f64 {
+    let bdi = ((cfg.bit_depth - 8) >> 1) as usize;
+    let qstep = AC_QLOOKUP[bdi][qidx as usize] as f64 / (1 << (cfg.bit_depth - 8)) as f64;
+    let scale = (1 << (cfg.bit_depth - 8)) as f64;
+    let step = qstep * scale / 8.0;
+    rd_lambda_factor() * step * step
+}
+
+/// The loop filter levels with the least error: scaled versions of the
+/// starting ones, each plane's chosen on its own error. `f.cur` is left
+/// unfiltered.
+fn search_lf(
+    f: &mut crate::decoder::FrameCtx,
+    src: &[Vec<u16>],
+    stride: &[usize],
+    start: [u32; 4],
+) -> [u32; 4] {
+    let saved = f.cur.clone();
+    let mut best = [(u64::MAX, 0u32); 3];
+    for scale in [0.0, 0.5, 0.75, 1.0, 1.25, 1.5] {
+        let lv = |l: u32| ((l as f64 * scale).round() as u32).min(63);
+        let levels = [lv(start[0]), lv(start[1]), lv(start[2]), lv(start[3])];
+        f.hdr.loop_filter_level = levels.map(|l| l as i32);
+        if levels[0] != 0 || levels[1] != 0 {
+            crate::decoder::postfilter::loop_filter(f);
+        }
+        for (p, b) in best.iter_mut().enumerate() {
+            let e = plane_sse(f, src, stride, p);
+            if e < b.0 {
+                *b = (e, if p == 0 { levels[0] } else { levels[1 + p] });
+            }
+        }
+        f.cur.planes.clone_from(&saved.planes);
+    }
+    // Chroma is filtered only when luma is.
+    if best[0].1 == 0 {
+        return [0; 4];
+    }
+    [best[0].1, best[0].1, best[1].1, best[2].1]
+}
+
+/// Squared error of plane `p` of `f.cur` against the source, inside the
+/// frame.
+fn plane_sse(f: &crate::decoder::FrameCtx, src: &[Vec<u16>], stride: &[usize], p: usize) -> u64 {
+    let (ssx, ssy) = f.plane_ss(p);
+    let w = (f.hdr.frame_width as usize + ssx) >> ssx;
+    let h = (f.hdr.frame_height as usize + ssy) >> ssy;
+    let pl = &f.cur.planes[p];
+    let mut s = 0u64;
+    for y in 0..h {
+        let a = &src[p][y * stride[p]..y * stride[p] + w];
+        let b = &pl.data[y * pl.stride..y * pl.stride + w];
+        for (&u, &v) in a.iter().zip(b) {
+            let d = u as i64 - v as i64;
+            s += (d * d) as u64;
+        }
+    }
+    s
 }
 
 /// Whether the encoder can write this colour description: code points in

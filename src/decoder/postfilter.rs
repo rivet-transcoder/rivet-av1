@@ -374,7 +374,7 @@ fn cdef_block(f: &FrameCtx, out: &mut FrameBuf, r: usize, c: usize, idx: usize) 
 }
 
 /// The CDEF direction process (7.15.2): `(yDir, var)`.
-fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
+pub(crate) fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
     let mut cost = [0i32; 8];
     let mut partial = [[0i32; 15]; 8];
     let x0 = c << MI_SIZE_LOG2;

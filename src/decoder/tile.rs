@@ -101,7 +101,6 @@ pub(crate) struct Plan {
     pub(crate) ref_frame: i32,
     pub(crate) ref_mv_idx: usize,
     pub(crate) mv: [Mv; 2],
-    pub(crate) cdef_idx: u32,
     /// The luma transform type, where there is a choice (greedy mode).
     pub(crate) tx_type: usize,
     /// `tx_depth` (intra) or the uniform variable-transform depth (inter)
@@ -947,7 +946,12 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let c = self.b.mi_col & cdef_mask4;
         let s = self.f.cdef_stride;
         if self.f.cdef_idx[(r >> 4) * s + (c >> 4)] == -1 {
-            let v = self.sd.literal(self.f.hdr.cdef_bits, self.plan.cdef_idx) as i8;
+            let planned = self
+                .enc
+                .as_ref()
+                .and_then(|e| e.cdef_table.as_ref())
+                .map_or(0, |t| t[(r >> 4) * s + (c >> 4)].max(0) as u32);
+            let v = self.sd.literal(self.f.hdr.cdef_bits, planned) as i8;
             let w4 = NUM_4X4_BLOCKS_WIDE[self.b.mi_size];
             let h4 = NUM_4X4_BLOCKS_HIGH[self.b.mi_size];
             let mut i = r;

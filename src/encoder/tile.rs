@@ -45,6 +45,8 @@ pub(crate) struct EncCtx {
     /// Scratch: the residual and the forward transform of a block.
     pub(crate) res: Vec<i32>,
     pub(crate) fc: Vec<f64>,
+    /// Each 64x64 block's CDEF index, once searched (`cdef_idx` layout).
+    pub(crate) cdef_table: Option<Vec<i8>>,
 }
 
 impl EncCtx {
