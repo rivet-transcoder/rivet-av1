@@ -738,6 +738,8 @@ pub(crate) struct LrBuffers {
     b: Vec<i32>,
     sq: Vec<i64>,
     sum: Vec<i64>,
+    /// `sq` and `sum` hold the integral images of `win` as it is.
+    integral: bool,
     pub(crate) out: Vec<u16>,
 }
 
@@ -768,6 +770,7 @@ pub(crate) fn lr_window(ctx: &LrCtx, x0: i32, y0: i32, w: usize, h: usize, buf: 
     let ww = w + 2 * LRB;
     let wh = h + 2 * LRB;
     buf.win.resize(ww * wh, 0);
+    buf.integral = false;
     for r in 0..wh {
         let y = y0 + r as i32 - LRB as i32;
         let row = &mut buf.win[r * ww..(r + 1) * ww];
@@ -856,6 +859,48 @@ pub(crate) fn restore_rect_from_window(
 /// The box filter process (7.17.3) over a rectangle, from the window in
 /// `buf.win`, into `buf.flt[pass]` (row stride `w`). Box sums come from
 /// integral images of the window.
+/// The integral images of the window (`sum`, `sq`; a first row and column
+/// of zeros), shared by every box filter of the window.
+fn integral_images(buf: &mut LrBuffers, ww: usize, wh: usize) {
+    let iw = ww + 1;
+    buf.sq.resize(iw * (wh + 1), 0);
+    buf.sum.resize(iw * (wh + 1), 0);
+    buf.sq[..iw].fill(0);
+    buf.sum[..iw].fill(0);
+    for y in 0..wh {
+        let mut rs = 0i64;
+        let mut rq = 0i64;
+        buf.sq[(y + 1) * iw] = 0;
+        buf.sum[(y + 1) * iw] = 0;
+        for x in 0..ww {
+            let c = buf.win[y * ww + x] as i64;
+            rs += c;
+            rq += c * c;
+            buf.sum[(y + 1) * iw + x + 1] = buf.sum[y * iw + x + 1] + rs;
+            buf.sq[(y + 1) * iw + x + 1] = buf.sq[y * iw + x + 1] + rq;
+        }
+    }
+    buf.integral = true;
+}
+
+/// The box filter's `A` for each clamped `z` (7.17.3): 256 at 255 and
+/// above, 1 at 0, else `((z << SGRPROJ_SGR_BITS) + z / 2) / (z + 1)`.
+const SGR_A2: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut z = 0;
+    while z < 256 {
+        t[z] = if z >= 255 {
+            256
+        } else if z == 0 {
+            1
+        } else {
+            (((z << SGRPROJ_SGR_BITS) + z / 2) / (z + 1)) as i32
+        };
+        z += 1;
+    }
+    t
+};
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn box_filter_rect(
     f: &FrameCtx,
@@ -877,22 +922,8 @@ pub(crate) fn box_filter_rect(
     let wh = h + 2 * LRB;
     // Integral images (one row and column of zeros first).
     let iw = ww + 1;
-    buf.sq.resize(iw * (wh + 1), 0);
-    buf.sum.resize(iw * (wh + 1), 0);
-    buf.sq[..iw].fill(0);
-    buf.sum[..iw].fill(0);
-    for y in 0..wh {
-        let mut rs = 0i64;
-        let mut rq = 0i64;
-        buf.sq[(y + 1) * iw] = 0;
-        buf.sum[(y + 1) * iw] = 0;
-        for x in 0..ww {
-            let c = buf.win[y * ww + x] as i64;
-            rs += c;
-            rq += c * c;
-            buf.sum[(y + 1) * iw + x + 1] = buf.sum[y * iw + x + 1] + rs;
-            buf.sq[(y + 1) * iw + x + 1] = buf.sq[y * iw + x + 1] + rq;
-        }
+    if !buf.integral {
+        integral_images(buf, ww, wh);
     }
     let eps = SGR_PARAMS[set][pass * 2 + 1];
     let bd = f.bit_depth;
@@ -906,6 +937,10 @@ pub(crate) fn box_filter_rect(
     buf.b.resize(aw * (h + 2), 0);
     let ru = r as usize;
     for i in 0..h + 2 {
+        // The first filter weighs only the odd rows' A and B.
+        if pass == 0 && (y0 + i as i32 - 1) & 1 == 0 {
+            continue;
+        }
         // Window row of position i - 1, box rows from it - r to it + r.
         let wy = i + LRB - 1;
         let (ya, yb) = (wy - ru, wy + ru + 1);
@@ -920,13 +955,7 @@ pub(crate) fn box_filter_rect(
             let d = round2(b, bd - 8) as i64;
             let p = (a * n as i64 - d * d).max(0);
             let z = round2_64(p * s as i64, SGRPROJ_MTABLE_BITS as u32);
-            let a2: i32 = if z >= 255 {
-                256
-            } else if z == 0 {
-                1
-            } else {
-                (((z << SGRPROJ_SGR_BITS) + z / 2) / (z + 1)) as i32
-            };
+            let a2 = SGR_A2[z.min(255) as usize];
             let b2 = ((1 << SGRPROJ_SGR_BITS) - a2) as i64 * b as i64 * one_over_n as i64;
             buf.a[i * aw + j] = a2;
             buf.b[i * aw + j] = round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;

@@ -251,6 +251,32 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     /// `decode_tile()`.
     pub(crate) fn decode_tile(&mut self) -> Result<()> {
+        self.begin_tile();
+        let sb4 = self.sb_size4();
+        let mut r = self.mi_row_start;
+        while r < self.mi_row_end {
+            self.begin_sb_row();
+            let mut c = self.mi_col_start;
+            while c < self.mi_col_end {
+                self.decode_sb(r, c)?;
+                c += sb4;
+            }
+            r += sb4;
+        }
+        Ok(())
+    }
+
+    /// The superblock size in 4x4 units.
+    pub(crate) fn sb_size4(&self) -> usize {
+        if self.f.seq.use_128x128_superblock {
+            32
+        } else {
+            16
+        }
+    }
+
+    /// The state reset at the start of a tile.
+    pub(crate) fn begin_tile(&mut self) {
         for p in 0..3 {
             self.above_level_ctx[p].fill(0);
             self.above_dc_ctx[p].fill(0);
@@ -265,32 +291,29 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 }
             }
         }
+    }
+
+    /// `clear_left_context()`, at the start of a superblock row.
+    pub(crate) fn begin_sb_row(&mut self) {
+        for p in 0..3 {
+            self.left_level_ctx[p].fill(0);
+            self.left_dc_ctx[p].fill(0);
+        }
+        self.left_seg_pred_ctx.fill(0);
+    }
+
+    /// One superblock of `decode_tile()`.
+    pub(crate) fn decode_sb(&mut self, r: usize, c: usize) -> Result<()> {
         let sb_size = if self.f.seq.use_128x128_superblock {
             BLOCK_128X128
         } else {
             BLOCK_64X64
         };
-        let sb_size4 = NUM_4X4_BLOCKS_WIDE[sb_size];
-        let mut r = self.mi_row_start;
-        while r < self.mi_row_end {
-            // clear_left_context()
-            for p in 0..3 {
-                self.left_level_ctx[p].fill(0);
-                self.left_dc_ctx[p].fill(0);
-            }
-            self.left_seg_pred_ctx.fill(0);
-            let mut c = self.mi_col_start;
-            while c < self.mi_col_end {
-                self.read_deltas = self.f.hdr.delta_q_present;
-                self.clear_cdef(r, c);
-                self.clear_block_decoded_flags(r, c, sb_size4);
-                self.read_lr(r, c, sb_size);
-                self.decode_partition(r, c, sb_size)?;
-                c += sb_size4;
-            }
-            r += sb_size4;
-        }
-        Ok(())
+        self.read_deltas = self.f.hdr.delta_q_present;
+        self.clear_cdef(r, c);
+        self.clear_block_decoded_flags(r, c, NUM_4X4_BLOCKS_WIDE[sb_size]);
+        self.read_lr(r, c, sb_size);
+        self.decode_partition(r, c, sb_size)
     }
 
     fn clear_block_decoded_flags(&mut self, r: usize, c: usize, sb_size4: usize) {

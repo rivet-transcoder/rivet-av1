@@ -139,6 +139,24 @@ impl FrameCtx {
         let c0 = ti.mi_col_starts[tile_col];
         let mr1 = ti.mi_row_starts[tile_row + 1];
         let mc1 = ti.mi_col_starts[tile_col + 1];
+        self.merge_rect(shard, r0, mr1, c0, mc1, last_row, last_col);
+    }
+
+    /// Copies what decoding the superblock-aligned rectangle of rows
+    /// `r0..mr1`, columns `c0..mc1` (in 4x4 units) wrote from `shard`;
+    /// a rectangle on the frame's last row or column takes the padding
+    /// beyond it too.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn merge_rect(
+        &mut self,
+        shard: &FrameCtx,
+        r0: usize,
+        mr1: usize,
+        c0: usize,
+        mc1: usize,
+        last_row: bool,
+        last_col: bool,
+    ) {
         let rows = self.mi_rows + 32;
         let ms = self.ms;
         let r1 = if last_row { rows } else { mr1 };
@@ -149,6 +167,11 @@ impl FrameCtx {
             self.mi[a..b].copy_from_slice(&shard.mi[a..b]);
             self.tx_types[a..b].copy_from_slice(&shard.tx_types[a..b]);
             self.segment_ids[a..b].copy_from_slice(&shard.segment_ids[a..b]);
+            for k in 0..2 {
+                if !self.palette_colors[k].is_empty() {
+                    self.palette_colors[k][a..b].copy_from_slice(&shard.palette_colors[k][a..b]);
+                }
+            }
         }
         for p in 0..self.num_planes {
             let (sx, sy) = self.plane_ss(p);
