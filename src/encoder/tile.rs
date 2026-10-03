@@ -24,7 +24,7 @@ use crate::tables::*;
 /// The encoder's per-frame state inside a tile.
 pub(crate) struct EncCtx {
     /// The source planes, padded like `CurrFrame` (edges replicated).
-    pub(crate) src: Vec<Vec<u16>>,
+    pub(crate) src: std::sync::Arc<Vec<Vec<u16>>>,
     pub(crate) stride: Vec<usize>,
     /// The quantised levels chosen for the transform block being coded,
     /// in `Quant`'s layout.

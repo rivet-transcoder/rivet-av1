@@ -243,8 +243,13 @@ fn tiles() {
     let frames: Vec<Frame> = (0..3).map(|t| synthetic(256, 64, t, 8)).collect();
     let mut cfg = cfg_for(256, 64);
     cfg.tile_cols_log2 = 2;
-    let (dec, sizes) = round_trip(cfg, &frames);
+    let (dec, sizes) = round_trip(cfg.clone(), &frames);
     assert!(psnr(&frames[1], &dec[1], 0) > 30.0, "{sizes:?}");
+    // In parallel: the same stream.
+    cfg.threads = 4;
+    let (dec4, sizes4) = round_trip(cfg, &frames);
+    assert_eq!(sizes, sizes4);
+    assert_eq!(dec, dec4);
     let frames: Vec<Frame> = (0..2).map(|t| synthetic(4104, 8, t, 8)).collect();
     let mut cfg = cfg_for(4104, 8);
     cfg.speed = 8;

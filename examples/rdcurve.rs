@@ -82,6 +82,7 @@ fn apply(cfg: &mut Config, name: &str, value: &str) {
             cfg.tools = av1::Tools::for_speed(cfg.speed);
         }
         "tiles" => cfg.tile_cols_log2 = n() as u32,
+        "threads" => cfg.threads = n() as usize,
         _ => {
             if !cfg.tools.set(name, n() as u32) {
                 panic!("unknown setting {name}");

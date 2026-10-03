@@ -74,6 +74,9 @@ pub struct Config {
     /// Which coding tools the encoder uses; `Tools::for_speed(speed)` by
     /// default.
     pub tools: Tools,
+    /// Threads coding tiles in parallel (with several tile columns); 1
+    /// codes on the caller's thread.
+    pub threads: usize,
 }
 
 /// The encoder's coding tools, each switchable (for measurement, or to
@@ -200,6 +203,7 @@ impl Config {
             speed: DEFAULT_SPEED,
             tile_cols_log2: 0,
             tools: Tools::for_speed(DEFAULT_SPEED),
+            threads: 1,
         }
     }
 }
@@ -327,10 +331,12 @@ impl Encoder {
             film_grain_params_present: false,
         };
         let q = cfg.quantizer.clamp(1, 255) as f64;
+        let mut dec = Decoder::new();
+        dec.set_threads(cfg.threads.max(1));
         Encoder {
             cfg,
             seq: Arc::new(seq),
-            dec: Decoder::new(),
+            dec,
             frame_num: 0,
             since_key: 0,
             force_key: false,
@@ -402,6 +408,7 @@ impl Encoder {
             self.dec.seq = Some(seq.clone());
         }
         let (src, stride) = self.source_planes(frame);
+        let src = Arc::new(src);
         let tools = self.cfg.tools;
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
         if tools.lf_search || tools.cdef {
@@ -414,7 +421,7 @@ impl Encoder {
             }
             f.hdr.loop_filter_level = p.lf.map(|l| l as i32);
             if p.lf[0] != 0 || p.lf[1] != 0 {
-                crate::decoder::postfilter::loop_filter(&mut f);
+                crate::decoder::postfilter::loop_filter_threads(&mut f, self.cfg.threads.max(1));
             }
             let mut cdef_table = None;
             if tools.cdef {
@@ -587,7 +594,7 @@ impl Encoder {
     fn code_frame(
         &mut self,
         p: &FrameParams,
-        src: &[Vec<u16>],
+        src: &Arc<Vec<Vec<u16>>>,
         stride: &[usize],
         replay: Option<Replay>,
     ) -> Result<Coded> {
@@ -598,30 +605,52 @@ impl Encoder {
         let mut f = self.dec.setup_frame(seq, hdr)?;
         let ti = f.hdr.tile_info.clone();
         let num_tiles = ti.cols * ti.rows;
-        let mut tiles = Vec::with_capacity(num_tiles);
-        let mut logs = Vec::with_capacity(num_tiles);
         let mut replay = replay;
+        let mut jobs: Vec<std::sync::Mutex<Option<Box<tile::EncCtx>>>> = Vec::new();
         for t in 0..num_tiles {
             let mut enc = self.enc_ctx(p, src, stride);
             if let Some(rp) = replay.as_mut() {
                 enc.rdo.replay = std::mem::take(&mut rp.logs[t]).into();
                 enc.cdef_table = rp.cdef.clone();
             }
-            let (bytes, log, saved) = {
-                let mut td = TileDecoder::new_encoder(&mut f, enc, t / ti.cols, t % ti.cols);
-                td.decode_tile()?;
-                let saved =
-                    if !td.f.hdr.disable_frame_end_update_cdf && t == ti.context_update_tile_id {
-                        Some(td.cdf.clone())
-                    } else {
-                        None
-                    };
-                let log = std::mem::take(&mut td.enc.as_mut().expect("encode mode").rdo.log);
-                let crate::symbol::Coder::Enc(e) = td.sd else {
-                    unreachable!("encode mode")
-                };
-                (e.finish(), log, saved)
+            jobs.push(std::sync::Mutex::new(Some(enc)));
+        }
+        // One tile: the bytes, the decision log, the CDFs if it is the tile
+        // the frame keeps them from.
+        type TileOut = (
+            Vec<u8>,
+            Vec<rdo::Decision>,
+            Option<Box<crate::cdf::CdfContext>>,
+        );
+        let code_tile = |f: &mut crate::decoder::FrameCtx, t: usize| -> Result<TileOut> {
+            let enc = jobs[t].lock().expect("job").take().expect("job");
+            let mut td = TileDecoder::new_encoder(f, enc, t / ti.cols, t % ti.cols);
+            td.decode_tile()?;
+            let saved = if !td.f.hdr.disable_frame_end_update_cdf && t == ti.context_update_tile_id
+            {
+                Some(td.cdf.clone())
+            } else {
+                None
             };
+            let log = std::mem::take(&mut td.enc.as_mut().expect("encode mode").rdo.log);
+            let crate::symbol::Coder::Enc(e) = td.sd else {
+                unreachable!("encode mode")
+            };
+            Ok((e.finish(), log, saved))
+        };
+        let threads = self.cfg.threads.max(1).min(num_tiles);
+        let outs: Vec<Result<TileOut>> = if threads > 1 {
+            // Tiles are independent: each is coded into a frame state of its
+            // own, then copied in.
+            let nums: Vec<usize> = (0..num_tiles).collect();
+            crate::decoder::tiles_in_parallel(&mut f, &nums, threads, code_tile)
+        } else {
+            (0..num_tiles).map(|t| code_tile(&mut f, t)).collect()
+        };
+        let mut tiles = Vec::with_capacity(num_tiles);
+        let mut logs = Vec::with_capacity(num_tiles);
+        for o in outs {
+            let (bytes, log, saved) = o?;
             if saved.is_some() {
                 f.saved_cdfs = saved;
             }
@@ -646,13 +675,18 @@ impl Encoder {
         self.q = (self.q + 12.0 * ratio.clamp(-2.0, 2.0)).clamp(1.0, 255.0);
     }
 
-    fn enc_ctx(&self, p: &FrameParams, src: &[Vec<u16>], stride: &[usize]) -> Box<tile::EncCtx> {
+    fn enc_ctx(
+        &self,
+        p: &FrameParams,
+        src: &Arc<Vec<Vec<u16>>>,
+        stride: &[usize],
+    ) -> Box<tile::EncCtx> {
         let bdi = ((self.cfg.bit_depth - 8) >> 1) as usize;
         let qstep =
             AC_QLOOKUP[bdi][p.qidx as usize] as f64 / (1 << (self.cfg.bit_depth - 8)) as f64;
         let scale = (1 << (self.cfg.bit_depth - 8)) as f64;
         Box::new(tile::EncCtx {
-            src: src.to_vec(),
+            src: src.clone(),
             stride: stride.to_vec(),
             coefs: Box::new([0; 1024]),
             lambda: 0.4 * qstep * scale,

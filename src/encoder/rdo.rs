@@ -131,8 +131,10 @@ impl TileDecoder<'_, '_> {
         s.pal[1].clear();
         for row in r0..r1 {
             s.mi.extend_from_slice(&f.mi[row * ms + c0..row * ms + c1]);
-            s.pal[0].extend_from_slice(&f.palette_colors[0][row * ms + c0..row * ms + c1]);
-            s.pal[1].extend_from_slice(&f.palette_colors[1][row * ms + c0..row * ms + c1]);
+            if !f.palette_colors[0].is_empty() {
+                s.pal[0].extend_from_slice(&f.palette_colors[0][row * ms + c0..row * ms + c1]);
+                s.pal[1].extend_from_slice(&f.palette_colors[1][row * ms + c0..row * ms + c1]);
+            }
         }
         grab(&mut s.tx_types, &f.tx_types, r0, r1, c0, c1);
         grab(&mut s.seg, &f.segment_ids, r0, r1, c0, c1);
@@ -188,10 +190,12 @@ impl TileDecoder<'_, '_> {
         let ms = f.ms;
         for (i, row) in (r0..r1).enumerate() {
             f.mi[row * ms + c0..row * ms + c1].copy_from_slice(&s.mi[i * w..(i + 1) * w]);
-            f.palette_colors[0][row * ms + c0..row * ms + c1]
-                .copy_from_slice(&s.pal[0][i * w..(i + 1) * w]);
-            f.palette_colors[1][row * ms + c0..row * ms + c1]
-                .copy_from_slice(&s.pal[1][i * w..(i + 1) * w]);
+            if !f.palette_colors[0].is_empty() {
+                f.palette_colors[0][row * ms + c0..row * ms + c1]
+                    .copy_from_slice(&s.pal[0][i * w..(i + 1) * w]);
+                f.palette_colors[1][row * ms + c0..row * ms + c1]
+                    .copy_from_slice(&s.pal[1][i * w..(i + 1) * w]);
+            }
             f.tx_types[row * ms + c0..row * ms + c1]
                 .copy_from_slice(&s.tx_types[i * w..(i + 1) * w]);
             f.segment_ids[row * ms + c0..row * ms + c1].copy_from_slice(&s.seg[i * w..(i + 1) * w]);
