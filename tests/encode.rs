@@ -7,6 +7,18 @@ mod common;
 
 use av1::{ChromaFormat, Config, Decoder, Encoder, Frame};
 
+/// A configuration for the tests: the default speed, or a fast one in
+/// unoptimised builds (the property and overflow-checking run), which
+/// still exercises the rate-distortion search.
+fn cfg_for(w: u32, h: u32) -> Config {
+    let mut c = Config::new(w, h);
+    if cfg!(debug_assertions) {
+        c.speed = 8;
+        c.tools = av1::Tools::for_speed(8);
+    }
+    c
+}
+
 fn psnr(a: &Frame, b: &Frame, plane: usize) -> f64 {
     let maxv = ((1u32 << a.bit_depth) - 1) as f64;
     let pl = a.planes[plane];
@@ -95,7 +107,7 @@ fn round_trip(cfg: Config, frames: &[Frame]) -> (Vec<Frame>, Vec<usize>) {
 fn key_frames_decode_to_the_reconstruction() {
     let frames: Vec<Frame> = (0..3).map(|t| synthetic(64, 48, t, 8)).collect();
     for q in [20, 100, 200] {
-        let mut cfg = Config::new(64, 48);
+        let mut cfg = cfg_for(64, 48);
         cfg.quantizer = q;
         cfg.keyframe_interval = 1;
         let (dec, _) = round_trip(cfg, &frames);
@@ -107,7 +119,7 @@ fn key_frames_decode_to_the_reconstruction() {
 fn odd_sizes() {
     for (w, h) in [(1, 1), (7, 5), (66, 66), (130, 34), (16, 200)] {
         let frames: Vec<Frame> = (0..3).map(|t| synthetic(w, h, t, 8)).collect();
-        let mut cfg = Config::new(w, h);
+        let mut cfg = cfg_for(w, h);
         cfg.quantizer = 60;
         round_trip(cfg, &frames);
     }
@@ -116,7 +128,7 @@ fn odd_sizes() {
 #[test]
 fn inter_frames_decode_to_the_reconstruction() {
     let frames: Vec<Frame> = (0..6).map(|t| synthetic(96, 64, t, 8)).collect();
-    let mut cfg = Config::new(96, 64);
+    let mut cfg = cfg_for(96, 64);
     cfg.quantizer = 80;
     let (dec, sizes) = round_trip(cfg, &frames);
     // Panning content: inter frames are much cheaper than the key frame.
@@ -129,7 +141,7 @@ fn inter_frames_decode_to_the_reconstruction() {
 #[test]
 fn ten_bit() {
     let frames: Vec<Frame> = (0..3).map(|t| synthetic(64, 64, t, 10)).collect();
-    let mut cfg = Config::new(64, 64);
+    let mut cfg = cfg_for(64, 64);
     cfg.bit_depth = 10;
     cfg.quantizer = 90;
     let (dec, _) = round_trip(cfg, &frames);
@@ -170,7 +182,7 @@ fn hdr_signalling_round_trips() {
             full_range: false,
             chroma_sample_position: 2,
         };
-        let mut cfg = Config::new(64, 48);
+        let mut cfg = cfg_for(64, 48);
         cfg.bit_depth = 10;
         cfg.keyframe_interval = 2;
         cfg.color = color;
@@ -182,7 +194,7 @@ fn hdr_signalling_round_trips() {
         }
     }
     // The identity matrix needs 4:4:4: refused by name.
-    let mut cfg = Config::new(16, 16);
+    let mut cfg = cfg_for(16, 16);
     cfg.color.matrix_coefficients = 0;
     let err = Encoder::new(cfg)
         .encode(&synthetic(16, 16, 0, 8))
@@ -195,7 +207,7 @@ fn hdr_signalling_round_trips() {
 #[test]
 fn forced_key_frames() {
     let frames: Vec<Frame> = (0..9).map(|t| synthetic(64, 48, t, 8)).collect();
-    let mut cfg = Config::new(64, 48);
+    let mut cfg = cfg_for(64, 48);
     cfg.keyframe_interval = 4;
     let mut enc = Encoder::new(cfg);
     let mut keys = Vec::new();
@@ -230,7 +242,7 @@ fn natural_video_quality_tracks_the_quantiser() {
     let mut last_psnr = f64::INFINITY;
     let mut last_size = 0usize;
     for q in [30, 90, 160] {
-        let mut cfg = Config::new(src[0].width, src[0].height);
+        let mut cfg = cfg_for(src[0].width, src[0].height);
         cfg.quantizer = q;
         let (dec, sizes) = round_trip(cfg, &src);
         let p: f64 = src
@@ -254,7 +266,7 @@ fn natural_video_quality_tracks_the_quantiser() {
 #[test]
 fn rate_control_tracks_the_target() {
     let src = natural(8);
-    let mut cfg = Config::new(src[0].width, src[0].height);
+    let mut cfg = cfg_for(src[0].width, src[0].height);
     cfg.quantizer = 60;
     cfg.keyframe_interval = 100;
     let target = 20_000u64;
@@ -277,7 +289,7 @@ fn quality_table() {
         "| quantiser | bytes (8 frames) | key frame | per inter frame | PSNR Y | PSNR U | PSNR V |"
     );
     for q in [20, 50, 90, 130, 170, 210, 250] {
-        let mut cfg = Config::new(src[0].width, src[0].height);
+        let mut cfg = cfg_for(src[0].width, src[0].height);
         cfg.quantizer = q;
         let (dec, sizes) = round_trip(cfg, &src);
         let n = src.len() as f64;
@@ -298,7 +310,7 @@ fn quality_table() {
             p(2)
         );
     }
-    let mut cfg = Config::new(src[0].width, src[0].height);
+    let mut cfg = cfg_for(src[0].width, src[0].height);
     cfg.quantizer = 90;
     cfg.keyframe_interval = 1;
     let (_, sizes) = round_trip(cfg, &src);

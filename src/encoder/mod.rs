@@ -16,6 +16,7 @@
 //! quantiser per frame or simple rate control; the loop filter.
 
 pub(crate) mod fwd;
+pub(crate) mod rdo;
 pub(crate) mod tile;
 
 use std::sync::Arc;
@@ -29,6 +30,9 @@ use crate::header::FrameHeader;
 use crate::obu::{ColorConfig, SequenceHeader, write_obu};
 use crate::tables::AC_QLOOKUP;
 use crate::{Error, Result};
+
+/// The default [`Config::speed`].
+pub const DEFAULT_SPEED: u32 = 4;
 
 /// Encoder settings.
 #[derive(Debug, Clone)]
@@ -61,10 +65,108 @@ pub struct Config {
     /// `METADATA_TYPE_HDR_MDCV`) after the sequence header of every key
     /// frame's temporal unit.
     pub hdr: HdrMetadata,
+    /// Encoder effort, 0 (slowest, best) to 10 (fastest): how much of the
+    /// rate-distortion search runs (see [`Tools`] for what it switches).
+    pub speed: u32,
+    /// Tile columns, as a log2 (0: one tile column; clamped to what the
+    /// frame allows). Tiles are coded in parallel.
+    pub tile_cols_log2: u32,
+    /// Which coding tools the encoder uses; `Tools::for_speed(speed)` by
+    /// default.
+    pub tools: Tools,
+}
+
+/// The encoder's coding tools, each switchable (for measurement, or to
+/// trade quality for speed). [`Tools::for_speed`] gives each speed's set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tools {
+    /// Rate-distortion search: partitions and block modes chosen by trial
+    /// coding, the rate from the CDFs in force. Off: a variance test and
+    /// SATD (the fastest).
+    pub rdo: bool,
+    /// Horizontal and vertical partitions (searched with `rdo`).
+    pub partition_rect: bool,
+    /// 8x8 blocks split to 4x4.
+    pub partition_4x4: bool,
+    /// Leave a block that codes flat (no residual) unsplit.
+    pub prune_split: bool,
+    /// Try skipping the residual of inter blocks.
+    pub rd_skip: bool,
+    /// `TX_MODE_SELECT`: transform sizes below the block size, searched.
+    pub tx_size: bool,
+    /// Luma transform types searched by trial coding (per transform block).
+    pub tx_type_rd: bool,
+    /// How many luma transform types the search tries (in a fixed order of
+    /// usefulness: DCT, ADST, the mixes, identity, the 1D ones, the
+    /// flipped ones).
+    pub tx_types: u8,
+    /// The full transform sets (`reduced_tx_set` = 0).
+    pub full_tx_set: bool,
+    /// Intra luma modes trialled per block (the best by SATD).
+    pub intra_candidates: u8,
+    /// Inter modes / vectors trialled per block.
+    pub inter_candidates: u8,
+}
+
+impl Tools {
+    /// The tools a speed setting uses (0 slowest to 10 fastest).
+    pub fn for_speed(speed: u32) -> Self {
+        let s = speed.min(10);
+        Tools {
+            rdo: s <= 8,
+            partition_rect: s <= 5,
+            partition_4x4: s <= 2,
+            prune_split: s >= 3,
+            rd_skip: s <= 6,
+            tx_size: s <= 6,
+            tx_type_rd: s <= 8,
+            tx_types: match s {
+                0..=1 => 16,
+                2..=3 => 7,
+                4..=5 => 5,
+                _ => 4,
+            },
+            full_tx_set: s <= 3,
+            intra_candidates: match s {
+                0..=1 => 5,
+                2..=4 => 3,
+                5..=6 => 2,
+                _ => 1,
+            },
+            inter_candidates: match s {
+                0..=1 => 5,
+                2..=4 => 3,
+                5..=6 => 2,
+                _ => 1,
+            },
+        }
+    }
+
+    /// Sets the switch called `name` (a field name; numbers as 0 / 1 or a
+    /// count); false if there is none.
+    pub fn set(&mut self, name: &str, value: u32) -> bool {
+        let b = value != 0;
+        match name {
+            "rdo" => self.rdo = b,
+            "partition_rect" => self.partition_rect = b,
+            "partition_4x4" => self.partition_4x4 = b,
+            "prune_split" => self.prune_split = b,
+            "rd_skip" => self.rd_skip = b,
+            "tx_size" => self.tx_size = b,
+            "tx_type_rd" => self.tx_type_rd = b,
+            "tx_types" => self.tx_types = value.min(16) as u8,
+            "full_tx_set" => self.full_tx_set = b,
+            "intra_candidates" => self.intra_candidates = value.min(13) as u8,
+            "inter_candidates" => self.inter_candidates = value.min(16) as u8,
+            _ => return false,
+        }
+        true
+    }
 }
 
 impl Config {
-    /// Settings for a `width` x `height` 8-bit 4:2:0 stream at quantiser 100.
+    /// Settings for a `width` x `height` 8-bit 4:2:0 stream at quantiser
+    /// 100, speed [`DEFAULT_SPEED`].
     pub fn new(width: u32, height: u32) -> Self {
         Config {
             width,
@@ -77,6 +179,9 @@ impl Config {
             search_range: 16,
             color: ColorInfo::default(),
             hdr: HdrMetadata::default(),
+            speed: DEFAULT_SPEED,
+            tile_cols_log2: 0,
+            tools: Tools::for_speed(DEFAULT_SPEED),
         }
     }
 }
@@ -319,13 +424,20 @@ impl Encoder {
         }
         let bdi = ((self.cfg.bit_depth - 8) >> 1) as usize;
         let qstep = AC_QLOOKUP[bdi][qidx as usize] as f64 / (1 << (self.cfg.bit_depth - 8)) as f64;
+        let scale = (1 << (self.cfg.bit_depth - 8)) as f64;
+        let step = qstep * scale / 8.0;
         Box::new(tile::EncCtx {
             src,
             stride,
             coefs: Box::new([0; 1024]),
-            lambda: 0.4 * qstep * (1 << (self.cfg.bit_depth - 8)) as f64,
-            inter: !key,
+            lambda: 0.4 * qstep * scale,
+            rd_lambda: rd_lambda_factor() * step * step,
+            refs: if key { Vec::new() } else { vec![LAST_FRAME] },
             search_range: self.cfg.search_range,
+            tools: self.cfg.tools,
+            rdo: Default::default(),
+            res: Vec::new(),
+            fc: Vec::new(),
         })
     }
 
@@ -403,13 +515,13 @@ impl Encoder {
         }
         w.f(3, 0); // loop_filter_sharpness
         w.flag(false); // loop_filter_delta_enabled
-        // read_tx_mode(): TX_MODE_LARGEST.
-        w.flag(false);
+        // read_tx_mode(): TX_MODE_SELECT when transform sizes are searched.
+        w.flag(self.cfg.tools.tx_size && self.cfg.tools.rdo);
         if !key {
             w.flag(false); // reference_select
             // skip_mode not allowed without reference_select.
         }
-        w.flag(true); // reduced_tx_set
+        w.flag(!(self.cfg.tools.full_tx_set && self.cfg.tools.rdo)); // reduced_tx_set
         if !key {
             for _ in LAST_FRAME..=ALTREF_FRAME {
                 w.flag(false); // is_global
@@ -436,4 +548,13 @@ fn check_color(c: &ColorInfo) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The rate-distortion Lagrange multiplier as a multiple of the squared
+/// quantiser step (`AV1_RD_LAMBDA` overrides it, for tuning).
+fn rd_lambda_factor() -> f64 {
+    std::env::var("AV1_RD_LAMBDA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.1)
 }

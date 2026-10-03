@@ -102,8 +102,11 @@ pub(crate) struct Plan {
     pub(crate) ref_mv_idx: usize,
     pub(crate) mv: [Mv; 2],
     pub(crate) cdef_idx: u32,
-    /// The luma transform type, where there is a choice.
+    /// The luma transform type, where there is a choice (greedy mode).
     pub(crate) tx_type: usize,
+    /// `tx_depth` (intra) or the uniform variable-transform depth (inter)
+    /// under `TX_MODE_SELECT`.
+    pub(crate) tx_depth: u8,
 }
 
 /// The decoder of one tile: the symbol decoder, the tile's CDFs, the
@@ -454,7 +457,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
     }
 
     /// `decode_partition( r, c, bSize )`.
-    fn decode_partition(&mut self, r: usize, c: usize, b_size: usize) -> Result<()> {
+    pub(crate) fn decode_partition(&mut self, r: usize, c: usize, b_size: usize) -> Result<()> {
         if r >= self.f.mi_rows || c >= self.f.mi_cols {
             return Ok(());
         }
@@ -465,15 +468,15 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let quarter_block4x4 = half_block4x4 >> 1;
         let has_rows = (r + half_block4x4) < self.f.mi_rows;
         let has_cols = (c + half_block4x4) < self.f.mi_cols;
+        let planned = if self.sd.encoding() && b_size >= BLOCK_8X8 && (has_rows || has_cols) {
+            self.enc_partition(r, c, b_size, has_rows, has_cols)?
+        } else {
+            0
+        };
         let partition = if b_size < BLOCK_8X8 {
             PARTITION_NONE
         } else if has_rows && has_cols {
             let (bsl, ctx) = self.partition_ctx(r, c, b_size, avail_u, avail_l);
-            let planned = if self.sd.encoding() {
-                self.enc_partition(r, c, b_size)
-            } else {
-                0
-            };
             let cdf = partition_cdf(&mut self.cdf, bsl, ctx);
             self.sd.symbol(cdf, planned)
         } else if has_cols {
@@ -489,7 +492,11 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 psum += p(PARTITION_VERT_4);
             }
             let mut cdf = [((1 << 15) - psum) as u16, 1 << 15, 0];
-            if self.sd.symbol(&mut cdf, 1) != 0 {
+            if self
+                .sd
+                .symbol(&mut cdf, (planned == PARTITION_SPLIT) as usize)
+                != 0
+            {
                 PARTITION_SPLIT
             } else {
                 PARTITION_HORZ
@@ -507,7 +514,11 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 psum += p(PARTITION_HORZ_4);
             }
             let mut cdf = [((1 << 15) - psum) as u16, 1 << 15, 0];
-            if self.sd.symbol(&mut cdf, 1) != 0 {
+            if self
+                .sd
+                .symbol(&mut cdf, (planned == PARTITION_SPLIT) as usize)
+                != 0
+            {
                 PARTITION_SPLIT
             } else {
                 PARTITION_VERT
@@ -593,7 +604,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
     }
 
     /// `decode_block( r, c, subSize )`.
-    fn decode_block(&mut self, r: usize, c: usize, sub_size: usize) -> Result<()> {
+    pub(crate) fn decode_block(&mut self, r: usize, c: usize, sub_size: usize) -> Result<()> {
         let ssx = self.ssx();
         let ssy = self.ssy();
         self.b = Block {
@@ -637,7 +648,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         b.compound_type = COMPOUND_AVERAGE;
         b.compound_idx = 1;
         if self.sd.encoding() {
-            self.enc_decide_block();
+            self.enc_decide_block()?;
         }
         self.mode_info();
         self.palette_tokens();
@@ -1406,7 +1417,10 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             false
         } else {
             let ctx = self.txfm_split_ctx(row, col, tx_sz);
-            self.sd.read_symbol(&mut self.cdf.txfm_split[ctx]) != 0
+            let planned = depth < self.plan.tx_depth as usize;
+            self.sd
+                .symbol(&mut self.cdf.txfm_split[ctx], planned as usize)
+                != 0
         };
         let w4 = TX_WIDTH[tx_sz] / MI_SIZE;
         let h4 = TX_HEIGHT[tx_sz] / MI_SIZE;
@@ -1500,11 +1514,12 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 0
             };
             let ctx = (above_w >= max_tx_w) as usize + (left_h >= max_tx_h) as usize;
+            let p = self.plan.tx_depth as usize;
             let tx_depth = match max_tx_depth {
-                4 => self.sd.read_symbol(&mut self.cdf.tx_64x64[ctx]),
-                3 => self.sd.read_symbol(&mut self.cdf.tx_32x32[ctx]),
-                2 => self.sd.read_symbol(&mut self.cdf.tx_16x16[ctx]),
-                _ => self.sd.read_symbol(&mut self.cdf.tx_8x8[ctx]),
+                4 => self.sd.symbol(&mut self.cdf.tx_64x64[ctx], p),
+                3 => self.sd.symbol(&mut self.cdf.tx_32x32[ctx], p),
+                2 => self.sd.symbol(&mut self.cdf.tx_16x16[ctx], p),
+                _ => self.sd.symbol(&mut self.cdf.tx_8x8[ctx], p.min(1)),
             };
             for _ in 0..tx_depth {
                 self.b.tx_size = SPLIT_TX_SIZE[self.b.tx_size];

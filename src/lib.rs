@@ -50,7 +50,7 @@ pub(crate) mod symbol;
 pub(crate) mod tables;
 
 pub use decoder::{Decoder, annexb_temporal_units};
-pub use encoder::{Config, Encoder};
+pub use encoder::{Config, Encoder, Tools};
 pub use frame::{
     ChromaFormat, ColorInfo, ContentLightLevel, Frame, HdrMetadata, MasteringDisplay, Plane,
 };

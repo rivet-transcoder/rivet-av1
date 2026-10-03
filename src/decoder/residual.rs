@@ -226,7 +226,7 @@ impl TileDecoder<'_, '_> {
     }
 
     /// `get_tx_set( txSz )`.
-    fn get_tx_set(&self, tx_sz: usize) -> usize {
+    pub(crate) fn get_tx_set(&self, tx_sz: usize) -> usize {
         let sqr = TX_SIZE_SQR[tx_sz];
         let sqr_up = TX_SIZE_SQR_UP[tx_sz];
         if sqr_up > TX_32X32 {
@@ -249,7 +249,7 @@ impl TileDecoder<'_, '_> {
         }
     }
 
-    fn is_tx_type_in_set(&self, tx_set: usize, tx_type: usize) -> bool {
+    pub(crate) fn is_tx_type_in_set(&self, tx_set: usize, tx_type: usize) -> bool {
         if self.b.is_inter {
             TX_TYPE_IN_SET_INTER[tx_set][tx_type] != 0
         } else {
@@ -356,7 +356,13 @@ impl TileDecoder<'_, '_> {
     }
 
     /// `coeffs( plane, startX, startY, txSz )`: returns `eob`.
-    fn coeffs(&mut self, plane: usize, start_x: usize, start_y: usize, tx_sz: usize) -> usize {
+    pub(crate) fn coeffs(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) -> usize {
         let x4 = start_x >> 2;
         let y4 = start_y >> 2;
         let w4 = TX_WIDTH[tx_sz] >> 2;
@@ -368,16 +374,16 @@ impl TileDecoder<'_, '_> {
         } else {
             1024.min(TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz])
         };
-        self.quant[..seg_eob].fill(0);
-        let mut eob = 0usize;
-        let mut cul_level: u32 = 0;
-        let mut dc_category = 0u8;
         // Encode mode: the encoder chooses the levels now, the prediction
-        // being in place; `target` holds them in Quant's layout.
+        // being in place (its search may code this block on trial).
         let mut target_eob = 0usize;
         if self.sd.encoding() {
             target_eob = self.enc_choose_coeffs(plane, start_x, start_y, tx_sz);
         }
+        self.quant[..seg_eob].fill(0);
+        let mut eob = 0usize;
+        let mut cul_level: u32 = 0;
+        let mut dc_category = 0u8;
         let ctx = self.all_zero_ctx(plane, tx_sz, x4, y4, w4, h4);
         let all_zero = self.sd.symbol(
             &mut self.cdf.txb_skip[tx_sz_ctx][ctx],
@@ -521,6 +527,11 @@ impl TileDecoder<'_, '_> {
                 }
             }
             cul_level = cul_level.min(63);
+        }
+        if eob > 0
+            && let Some(e) = self.enc.as_mut()
+        {
+            e.rdo.nonzero += 1;
         }
         for i in 0..w4 {
             self.above_level_ctx[plane][x4 + i] = cul_level as u8;
@@ -714,7 +725,7 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The quantiser index of the current block: `get_qindex( 0, segment_id )`.
-    fn qindex(&self) -> i32 {
+    pub(crate) fn qindex(&self) -> i32 {
         let h = &self.f.hdr;
         let seg = self.b.segment_id;
         if h.segmentation_enabled && h.feature_enabled[seg][SEG_LVL_ALT_Q] {
@@ -732,7 +743,7 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The reconstruct process (7.12.3).
-    fn reconstruct(&mut self, plane: usize, x: usize, y: usize, tx_sz: usize) {
+    pub(crate) fn reconstruct(&mut self, plane: usize, x: usize, y: usize, tx_sz: usize) {
         let bd = self.f.bit_depth;
         let dq_denom: i64 = match tx_sz {
             TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 2,

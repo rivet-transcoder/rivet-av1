@@ -199,6 +199,37 @@ pub(crate) struct SymbolEncoder {
     cnt: u32,
     range: u32,
     disable_update: bool,
+    /// Trial coding: symbols are not written and CDFs not adapted; their
+    /// cost under the current CDFs accumulates in `bits` instead.
+    pub(crate) counting: bool,
+    /// Accumulated cost of the symbols coded while `counting`, in 1/256
+    /// bit.
+    pub(crate) bits: u64,
+}
+
+/// `-log2(p / 32768)` in 1/256 bit, for `p` in steps of 8.
+fn cost_table() -> &'static [u32; 4097] {
+    static T: std::sync::OnceLock<[u32; 4097]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0u32; 4097];
+        for (i, v) in t.iter_mut().enumerate() {
+            let p = (i.max(1) as f64) / 4096.0;
+            *v = (-p.log2() * 256.0).round() as u32;
+        }
+        t
+    })
+}
+
+/// The cost, in 1/256 bit, of coding `symbol` with `cdf`.
+#[inline]
+pub(crate) fn symbol_cost(cdf: &[u16], symbol: usize) -> u32 {
+    let hi = cdf[symbol] as u32;
+    let lo = if symbol > 0 {
+        cdf[symbol - 1] as u32
+    } else {
+        0
+    };
+    cost_table()[((hi - lo) >> 3) as usize]
 }
 
 impl SymbolEncoder {
@@ -209,6 +240,8 @@ impl SymbolEncoder {
             cnt: 15,
             range: 1 << 15,
             disable_update,
+            counting: false,
+            bits: 0,
         }
     }
 
@@ -225,6 +258,10 @@ impl SymbolEncoder {
 
     /// Codes `symbol` with `cdf` (N + 1 entries) and adapts it.
     pub(crate) fn write_symbol(&mut self, cdf: &mut [u16], symbol: usize) {
+        if self.counting {
+            self.bits += symbol_cost(cdf, symbol) as u64;
+            return;
+        }
         let n = cdf.len() - 1;
         let r = self.range;
         let thresh = |s: isize| -> u32 {
@@ -261,6 +298,10 @@ impl SymbolEncoder {
 
     /// An equiprobable bit (`read_bool()`).
     pub(crate) fn write_bool(&mut self, bit: u32) {
+        if self.counting {
+            self.bits += 256;
+            return;
+        }
         let mut cdf = [1u16 << 14, 1 << 15, 0];
         let save = self.disable_update;
         self.disable_update = true;
@@ -314,6 +355,36 @@ pub(crate) enum Coder<'a> {
 impl Coder<'_> {
     pub(crate) fn encoding(&self) -> bool {
         matches!(self, Coder::Enc(_))
+    }
+
+    /// Switches trial coding (see `SymbolEncoder::counting`) on or off;
+    /// returns the previous setting.
+    pub(crate) fn set_counting(&mut self, on: bool) -> bool {
+        match self {
+            Coder::Enc(e) => std::mem::replace(&mut e.counting, on),
+            Coder::Dec(_) => false,
+        }
+    }
+
+    /// The trial cost accumulated so far, in 1/256 bit.
+    pub(crate) fn trial_bits(&self) -> u64 {
+        match self {
+            Coder::Enc(e) => e.bits,
+            Coder::Dec(_) => 0,
+        }
+    }
+
+    /// Resets the trial cost (a search undoes its trials' costs).
+    pub(crate) fn set_trial_bits(&mut self, v: u64) {
+        if let Coder::Enc(e) = self {
+            e.bits = v;
+        }
+    }
+
+    /// The cost of coding `v` with `cdf`, in 1/256 bit (nothing coded).
+    #[inline]
+    pub(crate) fn cost(cdf: &[u16], v: usize) -> u32 {
+        symbol_cost(cdf, v)
     }
 
     /// `read_symbol( cdf )` when decoding; codes `v` when encoding.
