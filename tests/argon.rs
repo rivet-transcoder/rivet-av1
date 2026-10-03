@@ -61,7 +61,7 @@ fn cases(root: &Path) -> Vec<Case> {
             else {
                 return;
             };
-            let file = input.rsplit('/').next().unwrap();
+            let file = input.rsplit('/').next().unwrap().trim_matches('"');
             let oppoint = line
                 .split_whitespace()
                 .find_map(|w| w.strip_prefix("--oppoint="))
