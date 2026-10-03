@@ -50,6 +50,10 @@ pub(crate) struct FrameCtx {
     pub(crate) num_planes: usize,
     pub(crate) mi_rows: usize,
     pub(crate) mi_cols: usize,
+    /// Row stride of the per-4x4 arrays: `mi_cols` plus a margin of 32,
+    /// which blocks overhanging the frame write into as the specification's
+    /// unbounded arrays allow (and later reads may see).
+    pub(crate) ms: usize,
     pub(crate) mi: Vec<Mi>,
     pub(crate) tx_types: Vec<u8>,
     pub(crate) lf_tx_sizes: [Vec<u8>; 3],
@@ -252,7 +256,8 @@ impl Decoder {
             c.clear_counts();
             c
         };
-        let n = mi_rows * mi_cols;
+        let ms = mi_cols + 32;
+        let n = (mi_rows + 32) * ms;
         let mut prev_segment_ids = vec![0u8; n];
         if hdr.primary_ref_frame != PRIMARY_REF_NONE && hdr.segmentation_enabled {
             let idx = hdr.ref_frame_idx[hdr.primary_ref_frame];
@@ -295,6 +300,7 @@ impl Decoder {
             num_planes,
             mi_rows,
             mi_cols,
+            ms,
             mi: vec![Mi::default(); n],
             tx_types: vec![0; n],
             lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
@@ -660,7 +666,7 @@ impl Decoder {
             for x8 in 0..w8 {
                 let row = 2 * y8 + 1;
                 let col = 2 * x8 + 1;
-                let m = &f.mi[row * f.mi_cols + col];
+                let m = &f.mi[row * f.ms + col];
                 for list in 0..2 {
                     let r = m.ref_frame[list] as i32;
                     if r > INTRA_FRAME {

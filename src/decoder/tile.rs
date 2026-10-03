@@ -172,7 +172,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     #[inline]
     pub(crate) fn mi(&self, r: usize, c: usize) -> &Mi {
-        &self.f.mi[r * self.f.mi_cols + c]
+        &self.f.mi[r * self.f.ms + c]
     }
 
     /// `is_inside( r, c )`.
@@ -583,8 +583,8 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             self.reset_block_context(bw4, bh4);
         }
         let is_compound = self.b.ref_frame[1] > INTRA_FRAME;
-        let cols = self.f.mi_cols;
-        let rows = self.f.mi_rows;
+        let cols = self.f.ms;
+        let rows = self.f.mi_rows + 32;
         for y in 0..bh4 {
             if r + y >= rows {
                 break;
@@ -769,7 +769,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     fn read_segment_id(&mut self) {
         let (r, c) = (self.b.mi_row, self.b.mi_col);
-        let cols = self.f.mi_cols;
+        let cols = self.f.ms;
         let prev_ul: i32 = if self.b.avail_u && self.b.avail_l {
             self.f.segment_ids[(r - 1) * cols + c - 1] as i32
         } else {
@@ -1118,7 +1118,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     fn get_palette_cache(&self, plane: usize) -> Vec<u16> {
         let (r, c) = (self.b.mi_row, self.b.mi_col);
-        let cols = self.f.mi_cols;
+        let cols = self.f.ms;
         let above_n = if (r * MI_SIZE) % 64 != 0 {
             self.mi(r - 1, c).palette_size[plane] as usize
         } else {
@@ -1277,9 +1277,9 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             }
         } else {
             self.read_tx_size(!self.b.skip || !self.b.is_inter);
-            let cols = self.f.mi_cols;
-            for row in mi_row..(mi_row + bh4).min(self.f.mi_rows) {
-                for col in mi_col..(mi_col + bw4).min(cols) {
+            let cols = self.f.ms;
+            for row in mi_row..mi_row + bh4 {
+                for col in mi_col..mi_col + bw4 {
                     self.f.mi[row * cols + col].inter_tx_size = self.b.tx_size as u8;
                 }
             }
@@ -1312,10 +1312,10 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 i += step_h;
             }
         } else {
-            let cols = self.f.mi_cols;
+            let cols = self.f.ms;
             for i in 0..h4 {
                 for j in 0..w4 {
-                    if row + i < self.f.mi_rows && col + j < cols {
+                    if row + i < self.f.mi_rows + 32 && col + j < cols {
                         self.f.mi[(row + i) * cols + col + j].inter_tx_size = tx_sz as u8;
                     }
                 }
@@ -1496,7 +1496,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         for y in 0..y_mis {
             for x in 0..x_mis {
                 seg = seg.min(
-                    self.f.prev_segment_ids[(self.b.mi_row + y) * self.f.mi_cols + self.b.mi_col + x],
+                    self.f.prev_segment_ids[(self.b.mi_row + y) * self.f.ms + self.b.mi_col + x],
                 );
             }
         }

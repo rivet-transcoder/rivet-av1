@@ -141,12 +141,12 @@ impl TileDecoder<'_, '_> {
                 self.reconstruct(plane, start_x, start_y, tx_sz);
             }
         }
-        let cols = self.f.mi_cols;
+        let cols = self.f.ms;
         for i in 0..step_y {
             for j in 0..step_x {
                 let rr = (row >> sub_y) + i;
                 let cc = (col >> sub_x) + j;
-                if rr < self.f.mi_rows && cc < cols {
+                if rr < self.f.mi_rows + 32 && cc < cols {
                     self.f.lf_tx_sizes[plane][rr * cols + cc] = tx_sz as u8;
                 }
                 let by = (sub_block_mi_row >> sub_y) + i;
@@ -246,7 +246,7 @@ impl TileDecoder<'_, '_> {
             return DCT_DCT;
         }
         let tx_set = self.get_tx_set(tx_sz);
-        let cols = self.f.mi_cols;
+        let cols = self.f.ms;
         if plane == 0 {
             return self.f.tx_types[block_y * cols + block_x] as usize;
         }
@@ -308,10 +308,10 @@ impl TileDecoder<'_, '_> {
     }
 
     fn set_tx_types(&mut self, x4: usize, y4: usize, tx_sz: usize, tx_type: usize) {
-        let cols = self.f.mi_cols;
+        let cols = self.f.ms;
         for i in 0..(TX_WIDTH[tx_sz] >> 2) {
             for j in 0..(TX_HEIGHT[tx_sz] >> 2) {
-                if y4 + j < self.f.mi_rows && x4 + i < cols {
+                if y4 + j < self.f.mi_rows + 32 && x4 + i < cols {
                     self.f.tx_types[(y4 + j) * cols + x4 + i] = tx_type as u8;
                 }
             }

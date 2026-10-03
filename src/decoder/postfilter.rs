@@ -52,7 +52,7 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
     let yp = y >> sub_y;
     let prev_row = row - ((dy as usize) << sub_y);
     let prev_col = col - ((dx as usize) << sub_x);
-    let cols = f.mi_cols;
+    let cols = f.ms;
     let m = f.mi[row * cols + col];
     let mi_size = m.mi_size as usize;
     let tx_sz = f.lf_tx_sizes[plane][(row >> sub_y) * cols + (col >> sub_x)] as usize;
@@ -108,7 +108,7 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
 /// thresh`.
 fn filter_strength(f: &FrameCtx, row: usize, col: usize, plane: usize, pass: usize) -> (i32, i32, i32, i32) {
     let h = &f.hdr;
-    let m = &f.mi[row * f.mi_cols + col];
+    let m = &f.mi[row * f.ms + col];
     let segment = m.segment_id as usize;
     let rf = m.ref_frame[0] as i32;
     let mode = m.y_mode as usize;
@@ -314,7 +314,7 @@ pub(crate) fn cdef(f: &FrameCtx) -> FrameBuf {
 
 /// The CDEF block process (7.15.1) for a block whose parameters are set.
 fn cdef_block(f: &FrameCtx, out: &mut FrameBuf, r: usize, c: usize, idx: usize) {
-    let cols = f.mi_cols;
+    let cols = f.ms;
     let sk = |rr: usize, cc: usize| f.mi[rr * cols + cc].skip;
     let skip = sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1);
     if skip {
