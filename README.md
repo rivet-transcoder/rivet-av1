@@ -19,8 +19,9 @@ and wants planar pictures back, or planar pictures and wants AV1.
 
 The decoder implements the whole specification, decodes tiles and runs its
 post-filters on several threads, and has SIMD (AVX2, NEON) in its hottest
-kernels; the encoder searches its decisions by rate-distortion trial coding
-and uses most of the toolbox. What is and is not there is listed precisely
+kernels; the encoder searches its decisions by rate-distortion trial coding,
+uses most of the toolbox, codes superblock rows on several threads, and
+holds an average bitrate. What is and is not there is listed precisely
 below.
 
 Published as `rivet-av1`; **imported as `av1`** (`use av1::…`). One
@@ -128,7 +129,15 @@ columns they need):
   candidates come from a cheap preselection: intra modes by SATD (with the
   mode's rate from the CDFs), inter modes per reference — NEARESTMV, the
   NEARMV entries of the reference list, GLOBALMV, and NEWMV with a
-  full-sample search then half- and quarter-sample refinement.
+  full-sample search then half- and quarter-sample refinement. From speed
+  5 the search is pruned: the motion search starts from the best of the
+  predicted, stacked and neighbouring vectors (a per-reference grid of the
+  vectors found so far) and descends in square steps; a partition
+  candidate is abandoned as soon as what it has coded costs more than the
+  best before it (lossless, every speed); a block whose whole coding costs
+  little per sample (a threshold in units of lambda, higher for blocks of
+  16x16 and less) is not split; transform depths are tried with the DCT
+  and the types searched only at the best depth.
 - **Intra**: all the directional and smooth modes, Paeth; **chroma from
   luma** (alphas fitted to the source); **palettes** (up to eight colours,
   their indices coded in the normative wavefront order) on frames that look
@@ -150,11 +159,20 @@ columns they need):
   by least squares, or a self-guided filter with fitted projection weights,
   or none; measured with the decoder's own restoration).
 - **Quantiser**: fixed (`Config::quantizer`, the `base_q_idx` 1–255), or
-  **rate control** to a target number of bits per frame
-  (`Config::target_bits_per_frame`).
+  **average-bitrate rate control** to a target number of bits per frame
+  (`Config::target_bits_per_frame`): each frame's quantiser is planned over
+  the next frames with a rate model per frame class refitted after every
+  frame, the complexity measured on the source before coding (so a scene
+  cut is priced before it is coded), what earlier frames over- or
+  under-spent repaid over 12 frames. Over 10-second clips it lands within
+  a few percent of the rate (below).
 - **Tiles and threads**: `Config::tile_cols_log2` tile columns, coded in
   parallel on `Config::threads` threads (the stream is the same as coding
-  them in turn).
+  them in turn). From speed 5 the decision search of each tile also runs
+  in a **wavefront** of superblock rows on the threads (each row two
+  superblocks behind the one above, with CDFs of its own; the frame is
+  then coded sequentially with the decisions), and the filter searches run
+  on them too; the stream does not depend on the thread count.
 - **Colour and HDR signalling**: `Config::color` is written into the
   sequence header's `color_config()` (primaries, transfer, matrix, range,
   chroma sample position; `color_description_present_flag` when any code
@@ -214,21 +232,43 @@ What each part of the search is worth at speed 4, measured by turning it off
 
 All together, the default speed (4) is **−50.8 %** BD-rate against the
 first encoder. `Config::speed` trades it for time (`Tools::for_speed` is
-what each speed switches; times are the encoder's, one thread):
+what each speed switches; times are the encoder's, one thread, on the
+same clips; the encoder kernels' SIMD and the abandoned partition
+candidates made every speed faster than the first table here, speed 4
+1.9x at the same BD-rate):
 
 | speed | BD-rate against speed 4 | time against speed 4 | megapixels/s |
 |---|---|---|---|
-| 0 | −3.3 % | 1.83x | 0.046 |
-| 2 | −1.5 % | 1.38x | 0.062 |
-| **4** (default) | — | 1x | 0.085 |
-| 6 | +10.9 % | 0.40x | 0.21 |
-| 8 | +30.4 % | 0.18x | 0.47 |
-| 9 (no search; filters searched) | +60.8 % | 0.05x | 1.7 |
-| 10 (the first encoder) | +103.9 % | 0.02x | 4.3 |
+| 0 | −3.0 % | 2.0x | 0.081 |
+| 2 | −1.2 % | 1.44x | 0.11 |
+| **4** (default) | — | 1x | 0.16 |
+| 5 | +3.3 % | 0.50x | 0.33 |
+| 6 | +12.0 % | 0.16x | 1.0 |
+| 7 | +19.3 % | 0.11x | 1.4 |
+| 8 | +27.3 % | 0.09x | 1.8 |
+| 9 (no search; filters searched) | +60.2 % | 0.06x | 2.8 |
+| 10 (the first encoder) | +103.6 % | 0.03x | 5.0 |
 
-Tile columns (`Config::tile_cols_log2`) coded on `Config::threads` threads
-scale it: at speed 6, 1280x720 encodes at 0.28 frames/s on one thread and
-0.78 with four tile columns on four threads.
+Speed 6 against the speed 6 before the pruned search: 0.20x the time at
++1.1 % on these clips; on three 1080x720 clips (10 frames, the same
+quantisers) 0.17x the time at −1.6 %. At 1080x720 it codes 1.6
+megapixels/s on one thread (2.0 frames/s), 2.9 on two, 4.7 on four and
+5.6 on eight — the same stream on each.
+
+Rate control, `examples/ratetest.rs`: 10-second clips (300 frames,
+640x360, a key frame every 240) of a still frame, a fast pan, a clip with
+fresh noise in every frame and a different scene every second, at 100,
+300 and 1000 kb/s, speed 6:
+
+| clip | 100 kb/s | 300 kb/s | 1000 kb/s |
+|---|---|---|---|
+| still | −1.4 % | −6.9 % | −65 % (quantiser 1: 351 kb/s is all it can use) |
+| pan | −0.1 % | +0.1 % | +0.6 % |
+| noise | +0.3 % | −0.1 % | −0.7 % |
+| scene cuts | +2.4 % | −0.4 % | +0.1 % |
+
+Speeds 4 and 8 land likewise: within 2.6 %, but for the still clip at
+1000 kb/s.
 
 Not there yet:
 
@@ -240,9 +280,8 @@ Not there yet:
   inter-intra, switchable interpolation filters, film grain parameters.
 - **Profiles 1 and 2**, 12-bit, monochrome; lossless (quantiser 0 needs the
   forward Walsh-Hadamard transform).
-- **Speed**: the search is thorough rather than clever; SIMD covers the
-  shared kernels (prediction, inverse transforms, filters) but not the
-  encoder's own (forward transforms, SATD, motion search).
+- **Lookahead**: rate control plans from the frames already coded (a
+  still scene undershoots high rates: it cannot use the bits).
 
 ## How it is checked
 
