@@ -12,14 +12,16 @@ conformance streams (the numbers are
 decode to exactly what it reconstructed.
 
 Written for the **[rivet](https://github.com/safewords/rivet)**
-transcoder, whose default output codec is AV1 (today through the
-third-party rav1d and rav1e crates). Usable on its own by anything that has
+transcoder, whose default output codec is AV1 (it is rivet's software AV1
+decoder and encoder). Usable on its own by anything that has
 AV1 temporal units (from IVF, WebM / Matroska, MP4, or an Annex B stream)
 and wants planar pictures back, or planar pictures and wants AV1.
 
-This is the first milestone of a longer effort: the decoder implements the
-whole specification but is single-threaded and scalar; the encoder is
-deliberately simple. What is and is not there is listed precisely below.
+The decoder implements the whole specification, decodes tiles and runs its
+post-filters on several threads, and has SIMD (AVX2, NEON) in its hottest
+kernels; the encoder searches its decisions by rate-distortion trial coding
+and uses most of the toolbox. What is and is not there is listed precisely
+below.
 
 Published as `rivet-av1`; **imported as `av1`** (`use av1::…`). One
 dependency (`thiserror`), no features, no build script.
@@ -60,10 +62,9 @@ Not there yet:
 
 - **Large-scale tile decoding** (tile list OBUs, 7.3). Optional for
   conformance; reported as `Error::Unsupported`.
-- **Speed.** Decoding is single-threaded scalar Rust that follows the
-  specification's processes closely: about 6 megapixels a second on one
-  core (some 7 frames/s at 1280x720) on the machine it was written on. No
-  tile or frame threading, no SIMD, no frame-buffer pool.
+- **Frame threading.** Frames are decoded one after another (tiles and
+  post-filters in parallel within each, see [Speed](#speed)); no frame-buffer
+  pool.
 - **Error recovery.** A corrupt frame returns `Error::Bitstream`; there is
   no concealment, so decoding should resume at the next key frame.
   Malformed input has not made it panic under the property tests below,
@@ -73,31 +74,87 @@ Not there yet:
   consistency, level limits) are not checked; `set_strict(true)` checks
   each tile's trailing padding.
 
+### Speed
+
+`Decoder::set_threads(n)` decodes the tiles of a tile group on up to `n`
+threads (each worker into a frame state of its own, whose tile region is
+copied back: the tiles of a frame read nothing another tile writes), runs
+the loop filter's vertical-edge pass in bands of rows and its
+horizontal-edge pass in bands of columns, and CDEF and loop restoration in
+bands of rows. The hottest kernels have SIMD versions chosen at run time —
+AVX2 on x86-64, NEON on aarch64 — each tested bit-exact against its scalar
+version: the CDEF block filter, the 8-tap interpolation filters, the
+inverse transforms (eight rows or columns at a time; the 64-bit scalar
+transforms remain for 12-bit and lossless) and the loop filter (the four
+samples along an edge at once). `AV1_NO_SIMD=1` turns them off.
+
+Throughput (`examples/decbench.rs`, best of three, on the machine this was
+written on — an AMD Ryzen 9 9950X), on 30-frame streams of camera
+footage from this crate's encoder at quantiser 100, one tile column or four:
+
+| stream | before | 1 thread | 4 threads |
+|---|---|---|---|
+| 1280x720, one tile | 25.9 MP/s | 59.1 MP/s | 74.6 MP/s |
+| 1280x720, four tile columns | 25.7 MP/s | 57.0 MP/s | 86.1 MP/s |
+| 1920x1080, one tile | 29.9 MP/s | 71.3 MP/s | 95.0 MP/s |
+| 1920x1080, four tile columns | 29.6 MP/s | 71.6 MP/s | 114.4 MP/s |
+
+On AOM test vectors (352x288, more of the toolbox, loop
+restoration, film grain), one thread: av1-1-b8-02-allintra 7.4 → 12.0 MP/s,
+av1-1-b10-00-quantizer-10 8.0 → 16.7, av1-1-b8-23-film_grain-50 11.8 → 25.2.
+With the SIMD versions off (`AV1_NO_SIMD=1`) the 1080p one-tile stream
+decodes at 34.7 MP/s on one thread.
+
+The first column is the decoder before this work (single-threaded scalar).
+Frames are still decoded one after another; no frame-parallel decoding.
+
 ## What it encodes
 
-Profile 0 (8- or 10-bit 4:2:0), one tile, one temporal unit per frame, any
-size from 1x1 up to 4096 wide:
+Profile 0 (8- or 10-bit 4:2:0), one temporal unit per frame, every frame
+shown, any size from 1x1 up (frames wider than 4096 are coded in the tile
+columns they need):
 
-- **Key frames**: 64x64 superblocks split down to 8x8 by a variance test
-  against the quantiser (partition search lite; 4x4 where the frame edge
-  forces it); each block takes the best of ten intra modes (DC, V, H,
-  smooth, smooth-V, smooth-H, Paeth, D45, D135, D67) by SATD on the actual
-  prediction, chroma chosen separately; the intra edge filter on.
-- **Transforms**: the largest that fits each block; for intra luma blocks up
-  to 16x16 the best of DCT, ADST and the two mixed DCT/ADST types by
-  distortion plus estimated rate on the quantised reconstruction; chroma
-  as the mode implies. A dead-zone quantiser.
-- **Inter frames**: single-reference prediction from the previous frame:
-  a full-sample square search then half- and quarter-sample refinement
-  with the normative 8-tap predictor; NEWMV (coded against the
-  specification's motion vector prediction), NEARESTMV or GLOBALMV, with
-  intra as the alternative per block; skip when the residual quantises to
-  nothing. CDFs carried from frame to frame through the reference slot.
+- **Rate-distortion search** (`encoder::rdo`). Every decision — the
+  partition of each block (none, horizontal, vertical, split; 4x4 at the
+  slowest speeds), the block's modes, its transform depth under
+  `TX_MODE_SELECT`, each luma transform block's type, skipping the residual
+  — is made by *coding* the candidates with the tile walker in counting
+  mode (each symbol's cost read from the CDFs in force, nothing written,
+  nothing adapted), measuring the reconstruction's squared error against
+  the source, and keeping the least `SSE + lambda * bits` (lambda a fixed
+  multiple of the squared quantiser step). Region snapshots put the state
+  back between candidates; a decision log replays the chosen sub-decisions
+  when the caller codes the winner, so nothing is searched twice. The
+  candidates come from a cheap preselection: intra modes by SATD (with the
+  mode's rate from the CDFs), inter modes per reference — NEARESTMV, the
+  NEARMV entries of the reference list, GLOBALMV, and NEWMV with a
+  full-sample search then half- and quarter-sample refinement.
+- **Intra**: all the directional and smooth modes, Paeth; **chroma from
+  luma** (alphas fitted to the source); **palettes** (up to eight colours,
+  their indices coded in the normative wavefront order) on frames that look
+  like screen content.
+- **Inter**: the last two frames and a golden frame (the key frame, then
+  every 16th frame coded with a finer quantiser) as references, each
+  searched; **compound prediction**, the average of LAST and another
+  reference.
+- **Transforms**: 4x4 to 64x64, every size; the full transform sets at the
+  slow speeds (DCT, ADST, flipped ADST, identity and their mixes, chosen per
+  transform block by trial coding), the reduced ones otherwise. A dead-zone
+  quantiser.
+- **In-loop filters**, searched on a first pass's reconstruction (the frame
+  is then coded again, replaying the first pass's decisions): the **loop
+  filter** levels (per plane), **CDEF** (each candidate strength applied
+  with the decoder's own filter, eight (luma, chroma) pairs chosen greedily
+  against the cost of signalling them, each 64x64 block taking its best)
+  and **loop restoration** (per unit: a Wiener filter fitted to the source
+  by least squares, or a self-guided filter with fitted projection weights,
+  or none; measured with the decoder's own restoration).
 - **Quantiser**: fixed (`Config::quantizer`, the `base_q_idx` 1–255), or
   **rate control** to a target number of bits per frame
-  (`Config::target_bits_per_frame`): the quantiser moves with the log of
-  the ratio of the bits a frame took to its target.
-- **Loop filter** at a level derived from the quantiser (or set).
+  (`Config::target_bits_per_frame`).
+- **Tiles and threads**: `Config::tile_cols_log2` tile columns, coded in
+  parallel on `Config::threads` threads (the stream is the same as coding
+  them in turn).
 - **Colour and HDR signalling**: `Config::color` is written into the
   sequence header's `color_config()` (primaries, transfer, matrix, range,
   chroma sample position; `color_description_present_flag` when any code
@@ -124,35 +181,68 @@ by construction, what a decoder outputs — and `tests/encode.rs` checks
 that every temporal unit decoded by a fresh decoder equals it, sample for
 sample.
 
-Not there yet (in rough order of value):
+### How well, and how fast
 
-- **Rate-distortion search** — modes are chosen by SATD, partitions by a
-  variance test; no trial coding of partitions, no `TX_MODE_SELECT`, no
-  rectangular partitions.
-- **More of the toolbox** — CDEF and loop restoration (the decoder's are
-  ready; the encoder writes neither), palette, intra block copy, filter
-  intra, chroma from luma, compound and multiple references, golden /
-  alt-ref structures, OBMC and warped motion, segmentation and adaptive
-  quantisation, film grain parameters.
+`examples/rdcurve.rs` is the measurement harness: it encodes Y4M clips at
+several quantisers, checks every temporal unit against a fresh decoder,
+and reports the Bjøntegaard delta rate (BD-rate: the change in bits at the
+same PSNR; negative is better) against an earlier run.
+`examples/av1toy4m.rs` makes clips from AV1 streams. The figures below are
+on four natural clips — three 640x360 crops of camera footage (C012, C003,
+C019) and the 352x288 source of `av1-1-b8-02-allintra` — 10 frames each
+(a key frame then nine inter frames), quantisers 64, 96, 128, 160 and 192.
+
+Each tool as it went in, BD-rate (PSNR-Y) against the encoder before it:
+
+| step | BD-rate |
+|---|---|
+| rate-distortion search: partitions (none, split, horizontal, vertical), modes, skip, transform depth and types by trial coding (against the first, greedy encoder) | −45.3 % |
+| … the transform types searched only on the chosen candidate, its decisions replayed; lambda tuned | −4.0 %, −1.9 % |
+| CDEF search | −7.0 % |
+| loop filter level search | −1.3 % |
+| LAST2 and golden references | −1.4 % |
+| chroma from luma | −0.3 % (−1.8 % PSNR-YUV) |
+| loop restoration | −1.1 % |
+| compound prediction | −0.8 % |
+| palettes (a synthetic screen-content clip; natural clips unchanged) | −69 % |
+
+What each part of the search is worth at speed 4, measured by turning it off
+(BD-rate of the encoder without it): horizontal and vertical partitions
++6.8 %, the per-block transform type search +3.1 %, trying the skip flag
++3.4 %, more than one inter candidate +3.4 %, more than one intra candidate
++1.3 %, transform depths +1.4 %.
+
+All together, the default speed (4) is **−50.8 %** BD-rate against the
+first encoder. `Config::speed` trades it for time (`Tools::for_speed` is
+what each speed switches; times are the encoder's, one thread):
+
+| speed | BD-rate against speed 4 | time against speed 4 | megapixels/s |
+|---|---|---|---|
+| 0 | −3.3 % | 1.83x | 0.046 |
+| 2 | −1.5 % | 1.38x | 0.062 |
+| **4** (default) | — | 1x | 0.085 |
+| 6 | +10.9 % | 0.40x | 0.21 |
+| 8 | +30.4 % | 0.18x | 0.47 |
+| 9 (no search; filters searched) | +60.8 % | 0.05x | 1.7 |
+| 10 (the first encoder) | +103.9 % | 0.02x | 4.3 |
+
+Tile columns (`Config::tile_cols_log2`) coded on `Config::threads` threads
+scale it: at speed 6, 1280x720 encodes at 0.28 frames/s on one thread and
+0.78 with four tile columns on four threads.
+
+Not there yet:
+
+- **Reordering**: frames are coded in display order; no hidden alt-ref
+  frame (`show_existing_frame`), no temporal filtering, no backward
+  references (compound is unidirectional).
+- **Adaptive quantisation** (delta q, segmentation), filter intra, intra
+  block copy, OBMC and warped motion, wedge / difference-weighted compound,
+  inter-intra, switchable interpolation filters, film grain parameters.
 - **Profiles 1 and 2**, 12-bit, monochrome; lossless (quantiser 0 needs the
   forward Walsh-Hadamard transform).
-- Speed: about 10 frames/s at 352x288, single-threaded.
-
-Measured on 8 frames of natural video at 352x288 (the decoded frames of
-`av1-1-b8-05-mv.ivf`, played back and forth; `tests/encode.rs`,
-`quality_table`), a key frame then seven inter frames:
-
-| quantiser | bytes (8 frames) | key frame | per inter frame | PSNR Y | PSNR U | PSNR V |
-|---|---|---|---|---|---|---|
-| 20 | 230 307 | 43 793 | 26 644 | 47.75 dB | 49.82 dB | 50.50 dB |
-| 50 | 141 411 | 29 427 | 15 997 | 42.31 dB | 46.46 dB | 46.79 dB |
-| 90 | 93 210 | 20 812 | 10 342 | 38.51 dB | 44.06 dB | 44.09 dB |
-| 130 | 53 295 | 12 820 | 5 782 | 34.17 dB | 41.40 dB | 41.12 dB |
-| 170 | 25 707 | 6 424 | 2 754 | 29.69 dB | 38.86 dB | 38.09 dB |
-| 210 | 10 151 | 2 380 | 1 110 | 25.58 dB | 36.63 dB | 35.74 dB |
-| 250 | 3 821 | 744 | 439 | 22.53 dB | 34.63 dB | 34.08 dB |
-
-At quantiser 90 the same eight frames take 161 503 bytes coded all-intra.
+- **Speed**: the search is thorough rather than clever; SIMD covers the
+  shared kernels (prediction, inverse transforms, filters) but not the
+  encoder's own (forward transforms, SATD, motion search).
 
 ## How it is checked
 
@@ -199,15 +289,22 @@ At quantiser 90 the same eight frames take 161 503 bytes coded all-intra.
   (`ARGON_LAYERS=1`); the others were not run for time. The large-scale-tile directories (tile
   list OBUs, unsupported) and the error-resilience directories (no
   reference output) are not run.
-- **The encoder** (`tests/encode.rs`): every temporal unit, decoded by a
-  fresh decoder with the padding check on, equals the encoder's
-  reconstruction exactly — key frames at several quantisers, inter frames,
-  10-bit, sizes from 1x1; PSNR falls and size falls as the quantiser rises;
+- **The encoder** (`tests/encode.rs`, and every run of
+  `examples/rdcurve.rs`): every temporal unit, decoded by a fresh decoder
+  with the padding check on, equals the encoder's reconstruction exactly —
+  key frames at several quantisers, inter frames, 10-bit, sizes from 1x1,
+  several tile columns coded in parallel (the same stream as in turn), HDR
+  signalling, forced key frames; PSNR falls and size falls as the quantiser rises;
   inter frames cost less than the key frame; rate control lands near its
   target.
 - **Malformed input** (`tests/fuzz.rs`, proptest): arbitrary bytes, and the
   committed vectors with bits flipped, bytes cut and garbage spliced in,
   decoded in debug builds (overflow checks on) — errors, never a panic.
+- **SIMD**: each SIMD kernel (CDEF, the interpolation filters, the inverse
+  transforms, the loop filter) against its scalar version on random input,
+  on x86-64 (AVX2) and on the aarch64 CI runners (NEON); `AV1_NO_SIMD=1`
+  turns the SIMD versions off. The test vectors and the Argon suite are
+  run with the decoder's threads on (`AV1_DECODE_THREADS`).
 - **Units**: the arithmetic encoder against the decoder over random symbol
   sequences with adapting CDFs (and the decoder's padding check); the
   forward transforms round-tripping through the normative inverse; the
