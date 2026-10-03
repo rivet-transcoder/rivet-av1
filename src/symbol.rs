@@ -141,7 +141,10 @@ impl<'a> SymbolDecoder<'a> {
         let pos = self.pos as i64;
         let trailing = pos - (self.max_bits + 15).min(15);
         let end = pos + self.max_bits.max(0);
-        if trailing < 0 || trailing as usize >= self.data.len() * 8 || end as usize > self.data.len() * 8 {
+        if trailing < 0
+            || trailing as usize >= self.data.len() * 8
+            || end as usize > self.data.len() * 8
+        {
             return false;
         }
         let bit = |p: i64| (self.data[(p >> 3) as usize] >> (7 - (p & 7))) & 1;
@@ -230,7 +233,8 @@ impl SymbolEncoder {
             }
             let s = s as usize;
             let f = (1u32 << 15) - cdf[s] as u32;
-            (((r >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - s - 1) as u32
+            (((r >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB * (n - s - 1) as u32
         };
         let prev = thresh(symbol as isize - 1);
         let cur = thresh(symbol as isize);
@@ -268,22 +272,6 @@ impl SymbolEncoder {
     pub(crate) fn write_literal(&mut self, n: u32, v: u32) {
         for i in (0..n).rev() {
             self.write_bool((v >> i) & 1);
-        }
-    }
-
-    /// `NS(n)`.
-    pub(crate) fn write_ns(&mut self, n: u32, v: u32) {
-        if n <= 1 {
-            return;
-        }
-        let w = floor_log2(n) + 1;
-        let m = (1 << w) - n;
-        if v < m {
-            self.write_literal(w - 1, v);
-        } else {
-            let t = v + m;
-            self.write_literal(w - 1, t >> 1);
-            self.write_literal(1, t & 1);
         }
     }
 
@@ -368,17 +356,6 @@ impl Coder<'_> {
             Coder::Dec(d) => d.read_literal(n),
             Coder::Enc(_) if n == 0 => 0,
             Coder::Enc(_) => panic!("the encoder does not code this literal"),
-        }
-    }
-
-    /// `NS(n)` when decoding; codes `v` when encoding.
-    pub(crate) fn ns(&mut self, n: u32, v: u32) -> u32 {
-        match self {
-            Coder::Dec(d) => d.read_ns(n),
-            Coder::Enc(e) => {
-                e.write_ns(n, v);
-                v
-            }
         }
     }
 

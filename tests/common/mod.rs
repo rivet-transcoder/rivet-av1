@@ -106,7 +106,9 @@ pub fn frame_md5(f: &av1::Frame) -> String {
         let ch = f.height.div_ceil(2) as usize;
         let mid = 1u16 << (f.bit_depth - 1);
         let plane: Vec<u8> = if f.bit_depth > 8 {
-            std::iter::repeat_n(mid.to_le_bytes(), cw * ch).flatten().collect()
+            std::iter::repeat_n(mid.to_le_bytes(), cw * ch)
+                .flatten()
+                .collect()
         } else {
             vec![mid as u8; cw * ch]
         };
@@ -159,7 +161,10 @@ pub fn run_vector(path: &Path) -> Outcome {
                 if expected.get(frames) == Some(&sum) {
                     matched += 1;
                 } else {
-                    failure = Some(format!("frame {frames} ({}x{}) md5 mismatch", f.width, f.height));
+                    failure = Some(format!(
+                        "frame {frames} ({}x{}) md5 mismatch",
+                        f.width, f.height
+                    ));
                 }
             }
             frames += 1;
@@ -169,7 +174,11 @@ pub fn run_vector(path: &Path) -> Outcome {
         }
     }
     if failure.is_none() && frames != expected.len() {
-        failure = Some(format!("{} frames shown, {} expected", frames, expected.len()));
+        failure = Some(format!(
+            "{} frames shown, {} expected",
+            frames,
+            expected.len()
+        ));
     }
     Outcome {
         name,
@@ -196,7 +205,10 @@ pub fn vectors_in(dir: &Path) -> Vec<PathBuf> {
     };
     let mut v: Vec<PathBuf> = rd
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "ivf" || e == "mkv" || e == "webm"))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e == "ivf" || e == "mkv" || e == "webm")
+        })
         .filter(|p| PathBuf::from(format!("{}.md5", p.display())).exists())
         .collect();
     v.sort();

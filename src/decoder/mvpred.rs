@@ -102,8 +102,10 @@ impl TileDecoder<'_, '_> {
             let ms = self.b.mi_size;
             let x = (self.b.mi_col * MI_SIZE + block_width(ms) / 2) as i64 - 1;
             let y = (self.b.mi_row * MI_SIZE + block_height(ms) / 2) as i64 - 1;
-            let xc = (gm[2] as i64 - (1 << WARPEDMODEL_PREC_BITS)) * x + gm[3] as i64 * y + gm[0] as i64;
-            let yc = gm[4] as i64 * x + (gm[5] as i64 - (1 << WARPEDMODEL_PREC_BITS)) * y + gm[1] as i64;
+            let xc =
+                (gm[2] as i64 - (1 << WARPEDMODEL_PREC_BITS)) * x + gm[3] as i64 * y + gm[0] as i64;
+            let yc =
+                gm[4] as i64 * x + (gm[5] as i64 - (1 << WARPEDMODEL_PREC_BITS)) * y + gm[1] as i64;
             if self.f.hdr.allow_high_precision_mv {
                 mv = [
                     round2signed_64(yc, WARPEDMODEL_PREC_BITS - 3) as i32,
@@ -299,7 +301,8 @@ impl TileDecoder<'_, '_> {
                 self.b.zero_mv_context = ((c0[0] - g[0][0]).abs() >= 16
                     || (c0[1] - g[0][1]).abs() >= 16
                     || (c1[0] - g[1][0]).abs() >= 16
-                    || (c1[1] - g[1][1]).abs() >= 16) as usize;
+                    || (c1[1] - g[1][1]).abs() >= 16)
+                    as usize;
             }
             let n = self.b.num_mv_found;
             let mut idx = 0;
@@ -320,7 +323,13 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The add reference motion vector process (7.10.2.7).
-    fn add_ref_mv_candidate(&mut self, mv_row: usize, mv_col: usize, is_compound: bool, weight: u32) {
+    fn add_ref_mv_candidate(
+        &mut self,
+        mv_row: usize,
+        mv_col: usize,
+        is_compound: bool,
+        weight: u32,
+    ) {
         let m = *self.mi(mv_row, mv_col);
         if !m.is_inter {
             return;
@@ -331,7 +340,9 @@ impl TileDecoder<'_, '_> {
                     self.search_stack(mv_row, mv_col, cand_list, weight);
                 }
             }
-        } else if m.ref_frame[0] as i32 == self.b.ref_frame[0] && m.ref_frame[1] as i32 == self.b.ref_frame[1] {
+        } else if m.ref_frame[0] as i32 == self.b.ref_frame[0]
+            && m.ref_frame[1] as i32 == self.b.ref_frame[1]
+        {
             self.compound_search_stack(mv_row, mv_col, weight);
         }
     }
@@ -386,7 +397,9 @@ impl TileDecoder<'_, '_> {
         let n = self.b.num_mv_found;
         let mut found = false;
         for idx in 0..n {
-            if self.b.ref_stack_mv[idx][0] == cand_mvs[0] && self.b.ref_stack_mv[idx][1] == cand_mvs[1] {
+            if self.b.ref_stack_mv[idx][0] == cand_mvs[0]
+                && self.b.ref_stack_mv[idx][1] == cand_mvs[1]
+            {
                 self.b.weight_stack[idx] += weight;
                 found = true;
                 break;
@@ -459,7 +472,8 @@ impl TileDecoder<'_, '_> {
                                     ref_id_count[list] += 1;
                                 } else if ref_diff_count[list] < 2 {
                                     if self.f.hdr.ref_frame_sign_bias[cand_ref as usize]
-                                        != self.f.hdr.ref_frame_sign_bias[self.b.ref_frame[list] as usize]
+                                        != self.f.hdr.ref_frame_sign_bias
+                                            [self.b.ref_frame[list] as usize]
                                     {
                                         cand_mv[0] *= -1;
                                         cand_mv[1] *= -1;
@@ -525,7 +539,9 @@ impl TileDecoder<'_, '_> {
             }
             let n = self.b.num_mv_found;
             if n == 1 {
-                if combined[0][0] == self.b.ref_stack_mv[0][0] && combined[0][1] == self.b.ref_stack_mv[0][1] {
+                if combined[0][0] == self.b.ref_stack_mv[0][0]
+                    && combined[0][1] == self.b.ref_stack_mv[0][1]
+                {
                     self.b.ref_stack_mv[n] = combined[1];
                 } else {
                     self.b.ref_stack_mv[n] = combined[0];
@@ -594,14 +610,16 @@ impl TileDecoder<'_, '_> {
     pub(crate) fn clamp_mv_row(&self, mvec: i32, border: i32) -> i32 {
         let bh4 = NUM_4X4_BLOCKS_HIGH[self.b.mi_size] as i32;
         let mb_to_top_edge = -((self.b.mi_row as i32 * MI_SIZE as i32) * 8);
-        let mb_to_bottom_edge = ((self.f.mi_rows as i32 - bh4 - self.b.mi_row as i32) * MI_SIZE as i32) * 8;
+        let mb_to_bottom_edge =
+            ((self.f.mi_rows as i32 - bh4 - self.b.mi_row as i32) * MI_SIZE as i32) * 8;
         clip3(mb_to_top_edge - border, mb_to_bottom_edge + border, mvec)
     }
 
     pub(crate) fn clamp_mv_col(&self, mvec: i32, border: i32) -> i32 {
         let bw4 = NUM_4X4_BLOCKS_WIDE[self.b.mi_size] as i32;
         let mb_to_left_edge = -((self.b.mi_col as i32 * MI_SIZE as i32) * 8);
-        let mb_to_right_edge = ((self.f.mi_cols as i32 - bw4 - self.b.mi_col as i32) * MI_SIZE as i32) * 8;
+        let mb_to_right_edge =
+            ((self.f.mi_cols as i32 - bw4 - self.b.mi_col as i32) * MI_SIZE as i32) * 8;
         clip3(mb_to_left_edge - border, mb_to_right_edge + border, mvec)
     }
 

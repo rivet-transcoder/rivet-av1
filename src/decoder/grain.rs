@@ -200,8 +200,16 @@ pub(crate) fn apply(
             for plane in 0..num_planes {
                 let psx = if plane > 0 { sub_x } else { 0 };
                 let psy = if plane > 0 { sub_y } else { 0 };
-                let pox = if psx != 0 { 6 + offset_x } else { 9 + offset_x * 2 };
-                let poy = if psy != 0 { 6 + offset_y } else { 9 + offset_y * 2 };
+                let pox = if psx != 0 {
+                    6 + offset_x
+                } else {
+                    9 + offset_x * 2
+                };
+                let poy = if psy != 0 {
+                    6 + offset_y
+                } else {
+                    9 + offset_y * 2
+                };
                 let nw = noise_w[plane];
                 for i in 0..(34 >> psy) {
                     for j in 0..(34 >> psx) {
@@ -214,7 +222,11 @@ pub(crate) fn apply(
                             let idx = i * nw + x * 2 + j;
                             if j < 2 && g.overlap_flag && x > 0 {
                                 let old = ns[plane][idx];
-                                gv = if j == 0 { old * 27 + gv * 17 } else { old * 17 + gv * 27 };
+                                gv = if j == 0 {
+                                    old * 27 + gv * 17
+                                } else {
+                                    old * 17 + gv * 27
+                                };
                                 gv = clip3(grain_min, grain_max, round2(gv, 5));
                             }
                             ns[plane][idx] = gv;
@@ -252,7 +264,11 @@ pub(crate) fn apply(
                 if psy == 0 {
                     if i < 2 && luma_num > 0 && g.overlap_flag {
                         let old = noise_stripe[luma_num - 1][plane][(i + 32) * nw + xx];
-                        gv = if i == 0 { old * 27 + gv * 17 } else { old * 17 + gv * 27 };
+                        gv = if i == 0 {
+                            old * 27 + gv * 17
+                        } else {
+                            old * 17 + gv * 27
+                        };
                         gv = clip3(grain_min, grain_max, round2(gv, 5));
                     }
                 } else if i < 1 && luma_num > 0 && g.overlap_flag {
@@ -289,7 +305,8 @@ pub(crate) fn apply(
                 let luma_next_x = (luma_x + 1).min(w - 1);
                 let average_luma = if sub_x != 0 {
                     round2(
-                        planes[0][luma_y * w + luma_x] as i32 + planes[0][luma_y * w + luma_next_x] as i32,
+                        planes[0][luma_y * w + luma_x] as i32
+                            + planes[0][luma_y * w + luma_next_x] as i32,
                         1,
                     )
                 } else {
@@ -300,7 +317,8 @@ pub(crate) fn apply(
                     let merged = if g.chroma_scaling_from_luma {
                         average_luma
                     } else {
-                        let combined = average_luma * (g.cb_luma_mult - 128) + orig * (g.cb_mult - 128);
+                        let combined =
+                            average_luma * (g.cb_luma_mult - 128) + orig * (g.cb_mult - 128);
                         ((combined >> 6) + ((g.cb_offset - 256) << (bd - 8))).clamp(0, maxv)
                     };
                     let noise = noise_image[1][yy * cw + xx];
@@ -312,7 +330,8 @@ pub(crate) fn apply(
                     let merged = if g.chroma_scaling_from_luma {
                         average_luma
                     } else {
-                        let combined = average_luma * (g.cr_luma_mult - 128) + orig * (g.cr_mult - 128);
+                        let combined =
+                            average_luma * (g.cr_luma_mult - 128) + orig * (g.cr_mult - 128);
                         ((combined >> 6) + ((g.cr_offset - 256) << (bd - 8))).clamp(0, maxv)
                     };
                     let noise = noise_image[2][yy * cw + xx];

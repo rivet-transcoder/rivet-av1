@@ -31,13 +31,16 @@
 //! - [`ivf`] — the IVF container.
 
 #![warn(missing_docs)]
+// The decoding processes are written as the specification writes them:
+// indexed loops over arrays, which keeps them checkable line by line.
+#![allow(clippy::needless_range_loop)]
 
 pub(crate) mod bits;
 pub(crate) mod cdf;
 pub(crate) mod consts;
 pub mod decoder;
-pub mod encoder;
 pub(crate) mod dsp;
+pub mod encoder;
 pub mod frame;
 pub(crate) mod header;
 pub mod ivf;
@@ -46,7 +49,7 @@ pub(crate) mod symbol;
 #[rustfmt::skip]
 pub(crate) mod tables;
 
-pub use decoder::{annexb_temporal_units, Decoder};
+pub use decoder::{Decoder, annexb_temporal_units};
 pub use encoder::{Config, Encoder};
 pub use frame::{ChromaFormat, ColorInfo, Frame, Plane};
 

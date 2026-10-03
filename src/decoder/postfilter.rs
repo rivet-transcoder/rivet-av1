@@ -5,7 +5,7 @@
 use crate::bits::floor_log2;
 use crate::consts::*;
 use crate::decoder::state::{FrameBuf, PlaneBuf};
-use crate::decoder::{count_units_in_frame, FrameCtx};
+use crate::decoder::{FrameCtx, count_units_in_frame};
 use crate::tables::*;
 
 // ---------------------------------------------------------------------------
@@ -59,16 +59,17 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
     let plane_size = f.plane_residual_size(mi_size, plane);
     let skip = m.skip;
     let is_intra = m.ref_frame[0] as i32 <= INTRA_FRAME;
-    let prev_tx_sz = f.lf_tx_sizes[plane][(prev_row >> sub_y) * cols + (prev_col >> sub_x)] as usize;
+    let prev_tx_sz =
+        f.lf_tx_sizes[plane][(prev_row >> sub_y) * cols + (prev_col >> sub_x)] as usize;
     let is_block_edge = if pass == 0 {
-        xp % block_width(plane_size) == 0
+        xp.is_multiple_of(block_width(plane_size))
     } else {
-        yp % block_height(plane_size) == 0
+        yp.is_multiple_of(block_height(plane_size))
     };
     let is_tx_edge = if pass == 0 {
-        xp % TX_WIDTH[tx_sz] == 0
+        xp.is_multiple_of(TX_WIDTH[tx_sz])
     } else {
-        yp % TX_HEIGHT[tx_sz] == 0
+        yp.is_multiple_of(TX_HEIGHT[tx_sz])
     };
     let apply_filter = is_tx_edge && (is_block_edge || !skip || is_intra);
     // The filter size process (7.14.3).
@@ -77,7 +78,11 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
     } else {
         TX_HEIGHT[prev_tx_sz].min(TX_HEIGHT[tx_sz])
     };
-    let filter_size = if plane == 0 { 16.min(base_size) } else { 8.min(base_size) };
+    let filter_size = if plane == 0 {
+        16.min(base_size)
+    } else {
+        8.min(base_size)
+    };
     let (mut lvl, mut limit, mut blimit, mut thresh) = filter_strength(f, row, col, plane, pass);
     if lvl == 0 {
         (lvl, limit, blimit, thresh) = filter_strength(f, prev_row, prev_col, plane, pass);
@@ -106,7 +111,13 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
 
 /// The adaptive filter strength process (7.14.4): `lvl, limit, blimit,
 /// thresh`.
-fn filter_strength(f: &FrameCtx, row: usize, col: usize, plane: usize, pass: usize) -> (i32, i32, i32, i32) {
+fn filter_strength(
+    f: &FrameCtx,
+    row: usize,
+    col: usize,
+    plane: usize,
+    pass: usize,
+) -> (i32, i32, i32, i32) {
     let h = &f.hdr;
     let m = &f.mi[row * f.ms + col];
     let segment = m.segment_id as usize;
@@ -124,7 +135,11 @@ fn filter_strength(f: &FrameCtx, row: usize, col: usize, plane: usize, pass: usi
     let mut lvl_seg = base_filter_level;
     let feature = SEG_LVL_ALT_LF_Y_V + i;
     if h.segmentation_enabled && h.feature_enabled[segment][feature] {
-        lvl_seg = clip3(0, MAX_LOOP_FILTER, h.feature_data[segment][feature] + lvl_seg);
+        lvl_seg = clip3(
+            0,
+            MAX_LOOP_FILTER,
+            h.feature_data[segment][feature] + lvl_seg,
+        );
     }
     if h.loop_filter_delta_enabled {
         let n_shift = lvl_seg >> 5;
@@ -251,7 +266,8 @@ fn sample_filter(
         filter = c(filter + 3 * (qs0 - ps0));
         let filter1 = c(filter + 4) >> 3;
         let filter2 = c(filter + 3) >> 3;
-        let set = |p: &mut PlaneBuf, k: isize, v: i32| p.data[(base + k * step) as usize] = v as u16;
+        let set =
+            |p: &mut PlaneBuf, k: isize, v: i32| p.data[(base + k * step) as usize] = v as u16;
         set(p, 0, c(qs0 - filter1) + off);
         set(p, -1, c(ps0 + filter2) + off);
         if !hev_mask {
@@ -261,7 +277,11 @@ fn sample_filter(
         }
     } else {
         // The wide filter process (7.14.6.4).
-        let log2_size = if filter_size == 8 || !flat_mask2 { 3 } else { 4 };
+        let log2_size = if filter_size == 8 || !flat_mask2 {
+            3
+        } else {
+            4
+        };
         let n: isize = if log2_size == 4 {
             6
         } else if plane == 0 {
@@ -381,8 +401,10 @@ fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
     cost[2] *= DIV_TABLE[8];
     cost[6] *= DIV_TABLE[8];
     for i in 0..7 {
-        cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i]) * DIV_TABLE[i + 1];
-        cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i]) * DIV_TABLE[i + 1];
+        cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i])
+            * DIV_TABLE[i + 1];
+        cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i])
+            * DIV_TABLE[i + 1];
     }
     cost[0] += partial[0][7] * partial[0][7] * DIV_TABLE[8];
     cost[4] += partial[4][7] * partial[4][7] * DIV_TABLE[8];
@@ -393,7 +415,8 @@ fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
         }
         cost[i] *= DIV_TABLE[8];
         for j in 0..3 {
-            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j]) * DIV_TABLE[2 * j + 2];
+            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j])
+                * DIV_TABLE[2 * j + 2];
         }
         i += 2;
     }
@@ -502,7 +525,8 @@ pub(crate) fn upscale(f: &FrameCtx, input: &FrameBuf) -> Option<FrameBuf> {
         let plane_h = round2(f.hdr.frame_height as i32, sub_y as u32) as usize;
         let step_x = ((downscaled_w << SUPERRES_SCALE_BITS) + upscaled_w / 2) / upscaled_w;
         let err = upscaled_w * step_x - (downscaled_w << SUPERRES_SCALE_BITS);
-        let mut initial_subpel_x = (-((upscaled_w - downscaled_w) << (SUPERRES_SCALE_BITS - 1)) + upscaled_w / 2)
+        let mut initial_subpel_x = (-((upscaled_w - downscaled_w) << (SUPERRES_SCALE_BITS - 1))
+            + upscaled_w / 2)
             / upscaled_w
             + (1 << (SUPERRES_EXTRA_BITS - 1))
             - err / 2;
@@ -519,10 +543,15 @@ pub(crate) fn upscale(f: &FrameCtx, input: &FrameBuf) -> Option<FrameBuf> {
                 let src_x_subpel = ((src_x & SUPERRES_SCALE_MASK) >> SUPERRES_EXTRA_BITS) as usize;
                 let mut sum = 0i32;
                 for k in 0..SUPERRES_FILTER_TAPS {
-                    let sx = (src_x_px + (k - SUPERRES_FILTER_OFFSET) as i64).clamp(0, max_x) as usize;
+                    let sx =
+                        (src_x_px + (k - SUPERRES_FILTER_OFFSET) as i64).clamp(0, max_x) as usize;
                     sum += row[sx] as i32 * UPSCALE_FILTER[src_x_subpel][k as usize];
                 }
-                dst.set(x as usize, y, round2(sum, FILTER_BITS as u32).clamp(0, maxv) as u16);
+                dst.set(
+                    x as usize,
+                    y,
+                    round2(sum, FILTER_BITS as u32).clamp(0, maxv) as u16,
+                );
             }
         }
         out.planes.push(dst);
@@ -574,7 +603,15 @@ pub(crate) fn loop_restoration(f: &FrameCtx, cur: &FrameBuf, cdef: FrameBuf) -> 
         while x < f.hdr.upscaled_width as usize {
             for plane in 0..f.num_planes {
                 if f.hdr.frame_restoration_type[plane] != RESTORE_NONE {
-                    loop_restore_block(f, cur, &cdef, &mut lr, plane, y >> MI_SIZE_LOG2, x >> MI_SIZE_LOG2);
+                    loop_restore_block(
+                        f,
+                        cur,
+                        &cdef,
+                        &mut lr,
+                        plane,
+                        y >> MI_SIZE_LOG2,
+                        x >> MI_SIZE_LOG2,
+                    );
                 }
             }
             x += MI_SIZE;
@@ -585,15 +622,29 @@ pub(crate) fn loop_restoration(f: &FrameCtx, cur: &FrameBuf, cdef: FrameBuf) -> 
 }
 
 /// The loop restore block process (7.17.1).
-fn loop_restore_block(f: &FrameCtx, cur: &FrameBuf, cdef: &FrameBuf, lr: &mut FrameBuf, plane: usize, row: usize, col: usize) {
+fn loop_restore_block(
+    f: &FrameCtx,
+    cur: &FrameBuf,
+    cdef: &FrameBuf,
+    lr: &mut FrameBuf,
+    plane: usize,
+    row: usize,
+    col: usize,
+) {
     let luma_y = row * MI_SIZE;
     let stripe_num = (luma_y + 8) / 64;
     let (sub_x, sub_y) = f.plane_ss(plane);
     let stripe_start_y = (-8 + stripe_num as i32 * 64) >> sub_y;
     let stripe_end_y = stripe_start_y + (64 >> sub_y) - 1;
     let unit_size = f.hdr.loop_restoration_size[plane];
-    let unit_rows = count_units_in_frame(unit_size, round2(f.hdr.frame_height as i32, sub_y as u32) as usize);
-    let unit_cols = count_units_in_frame(unit_size, round2(f.hdr.upscaled_width as i32, sub_x as u32) as usize);
+    let unit_rows = count_units_in_frame(
+        unit_size,
+        round2(f.hdr.frame_height as i32, sub_y as u32) as usize,
+    );
+    let unit_cols = count_units_in_frame(
+        unit_size,
+        round2(f.hdr.upscaled_width as i32, sub_x as u32) as usize,
+    );
     let unit_row = (unit_rows - 1).min(((row * MI_SIZE + 8) >> sub_y) / unit_size);
     let unit_col = (unit_cols - 1).min(((col * MI_SIZE) >> sub_x) / unit_size);
     let plane_end_x = round2(f.hdr.upscaled_width as i32, sub_x as u32) - 1;
@@ -670,7 +721,16 @@ fn loop_restore_block(f: &FrameCtx, cur: &FrameBuf, cdef: &FrameBuf, lr: &mut Fr
 
 /// The box filter process (7.17.3).
 #[allow(clippy::too_many_arguments)]
-fn box_filter(f: &FrameCtx, ctx: &LrCtx, x: i32, y: i32, w: i32, h: i32, set: usize, pass: usize) -> [[i32; 4]; 4] {
+fn box_filter(
+    f: &FrameCtx,
+    ctx: &LrCtx,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    set: usize,
+    pass: usize,
+) -> [[i32; 4]; 4] {
     let mut out = [[0i32; 4]; 4];
     let r = SGR_PARAMS[set][pass * 2];
     if r == 0 {
@@ -695,7 +755,7 @@ fn box_filter(f: &FrameCtx, ctx: &LrCtx, x: i32, y: i32, w: i32, h: i32, set: us
                     b += c;
                 }
             }
-            let a = round2_64(a, 2 * (bd - 8)) as i64;
+            let a = round2_64(a, 2 * (bd - 8));
             let d = round2(b, bd - 8) as i64;
             let p = (a * n as i64 - d * d).max(0);
             let z = round2_64(p * s as i64, SGRPROJ_MTABLE_BITS as u32);
@@ -708,7 +768,8 @@ fn box_filter(f: &FrameCtx, ctx: &LrCtx, x: i32, y: i32, w: i32, h: i32, set: us
             };
             let b2 = ((1 << SGRPROJ_SGR_BITS) - a2) as i64 * b as i64 * one_over_n as i64;
             a_arr[(i + 1) as usize][(j + 1) as usize] = a2;
-            b_arr[(i + 1) as usize][(j + 1) as usize] = round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;
+            b_arr[(i + 1) as usize][(j + 1) as usize] =
+                round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;
         }
     }
     for i in 0..h {
@@ -734,7 +795,8 @@ fn box_filter(f: &FrameCtx, ctx: &LrCtx, x: i32, y: i32, w: i32, h: i32, set: us
                 }
             }
             let v = a * ctx.cdef.get((x + j) as usize, (y + i) as usize) as i32 + b;
-            out[i as usize][j as usize] = round2(v, (SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS) as u32);
+            out[i as usize][j as usize] =
+                round2(v, (SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS) as u32);
         }
     }
     out

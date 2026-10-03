@@ -13,7 +13,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut n = 0;
     for (i, pkt) in av1::ivf::IvfReader::new(&data)?.enumerate() {
         for f in dec.decode_all(pkt?.data)? {
-            println!("tu {i:4} frame {n:5} {}x{} {}-bit {:?}", f.width, f.height, f.bit_depth, f.chroma);
+            println!(
+                "tu {i:4} frame {n:5} {}x{} {}-bit {:?}",
+                f.width, f.height, f.bit_depth, f.chroma
+            );
             n += 1;
         }
     }

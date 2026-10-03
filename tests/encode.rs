@@ -30,7 +30,10 @@ fn psnr(a: &Frame, b: &Frame, plane: usize) -> f64 {
 fn natural(n: usize) -> Vec<Frame> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/av1-1-b8-05-mv.ivf");
     let mut d = Decoder::new();
-    let src: Vec<Frame> = common::packets(&p).iter().filter_map(|pk| d.decode(pk).unwrap()).collect();
+    let src: Vec<Frame> = common::packets(&p)
+        .iter()
+        .filter_map(|pk| d.decode(pk).unwrap())
+        .collect();
     let period = 2 * src.len() - 2;
     (0..n)
         .map(|i| {
@@ -74,7 +77,10 @@ fn round_trip(cfg: Config, frames: &[Frame]) -> (Vec<Frame>, Vec<usize>) {
     for (i, f) in frames.iter().enumerate() {
         let pkt = enc.encode(f).unwrap();
         sizes.push(pkt.len());
-        let d = dec.decode(&pkt).unwrap().expect("every packet shows a frame");
+        let d = dec
+            .decode(&pkt)
+            .unwrap()
+            .expect("every packet shows a frame");
         assert_eq!(
             &d,
             enc.reconstruction().unwrap(),
@@ -139,11 +145,19 @@ fn natural_video_quality_tracks_the_quantiser() {
         let mut cfg = Config::new(src[0].width, src[0].height);
         cfg.quantizer = q;
         let (dec, sizes) = round_trip(cfg, &src);
-        let p: f64 = src.iter().zip(&dec).map(|(a, b)| psnr(a, b, 0)).sum::<f64>() / src.len() as f64;
+        let p: f64 = src
+            .iter()
+            .zip(&dec)
+            .map(|(a, b)| psnr(a, b, 0))
+            .sum::<f64>()
+            / src.len() as f64;
         let size: usize = sizes.iter().sum();
         eprintln!("q {q}: {size} bytes, luma PSNR {p:.2} dB");
         assert!(p < last_psnr, "PSNR must fall as the quantiser rises");
-        assert!(last_size == 0 || size < last_size, "size must fall as the quantiser rises");
+        assert!(
+            last_size == 0 || size < last_size,
+            "size must fall as the quantiser rises"
+        );
         last_psnr = p;
         last_size = size;
     }
@@ -158,7 +172,8 @@ fn rate_control_tracks_the_target() {
     let target = 20_000u64;
     cfg.target_bits_per_frame = Some(target);
     let (_, sizes) = round_trip(cfg, &src);
-    let inter_bits: u64 = sizes[4..].iter().map(|&s| s as u64 * 8).sum::<u64>() / (sizes.len() - 4) as u64;
+    let inter_bits: u64 =
+        sizes[4..].iter().map(|&s| s as u64 * 8).sum::<u64>() / (sizes.len() - 4) as u64;
     eprintln!("rate control: sizes {sizes:?}, inter average {inter_bits} bits for target {target}");
     assert!(inter_bits < target * 3 && inter_bits > target / 3);
 }

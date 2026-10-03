@@ -332,7 +332,11 @@ pub(crate) fn round2(x: i32, n: u32) -> i32 {
 /// `Round2( x, n )` on 64 bits.
 #[inline]
 pub(crate) fn round2_64(x: i64, n: u32) -> i64 {
-    if n == 0 { x } else { (x + (1i64 << (n - 1))) >> n }
+    if n == 0 {
+        x
+    } else {
+        (x + (1i64 << (n - 1))) >> n
+    }
 }
 
 /// `Round2Signed( x, n )`.

@@ -58,7 +58,8 @@ fn satd(a: &[i32], b: &[i32], w: usize, h: usize) -> u64 {
             for j in 0..4 {
                 let (a0, a1, a2, a3) = (d[j], d[4 + j], d[8 + j], d[12 + j]);
                 let (s0, s1, d0, d1) = (a0 + a1, a2 + a3, a0 - a1, a2 - a3);
-                total += ((s0 + s1).abs() + (s0 - s1).abs() + (d0 + d1).abs() + (d0 - d1).abs()) as u64;
+                total +=
+                    ((s0 + s1).abs() + (s0 - s1).abs() + (d0 + d1).abs() + (d0 - d1).abs()) as u64;
             }
         }
     }
@@ -93,7 +94,8 @@ impl TileDecoder<'_, '_> {
 
     fn qstep(&self) -> f64 {
         let bdi = ((self.f.bit_depth - 8) >> 1) as usize;
-        AC_QLOOKUP[bdi][self.f.hdr.base_q_idx as usize] as f64 / (1 << (self.f.bit_depth - 8)) as f64
+        AC_QLOOKUP[bdi][self.f.hdr.base_q_idx as usize] as f64
+            / (1 << (self.f.bit_depth - 8)) as f64
     }
 
     /// The partition of a block whose four quadrants are all inside the
@@ -124,7 +126,9 @@ impl TileDecoder<'_, '_> {
         };
         let whole = var(x0, y0, n);
         let h = n / 2;
-        let quads = (var(x0, y0, h) + var(x0 + h, y0, h) + var(x0, y0 + h, h) + var(x0 + h, y0 + h, h)) / 4.0;
+        let quads =
+            (var(x0, y0, h) + var(x0 + h, y0, h) + var(x0, y0 + h, h) + var(x0 + h, y0 + h, h))
+                / 4.0;
         let q = self.qstep();
         // Split when the block is not flat at this quantiser and splitting
         // explains a good part of its variance.
@@ -140,19 +144,25 @@ impl TileDecoder<'_, '_> {
     /// encoder uses): `(x, y, haveLeft, haveAbove, haveAboveRight,
     /// haveBelowLeft, log2W, log2H)`.
     #[allow(clippy::type_complexity)]
-    fn intra_args(&self, plane: usize) -> (usize, usize, bool, bool, bool, bool, usize, usize, usize) {
+    fn intra_args(
+        &self,
+        plane: usize,
+    ) -> (usize, usize, bool, bool, bool, bool, usize, usize, usize) {
         let (sub_x, sub_y) = self.f.plane_ss(plane);
         let tx_sz = if self.b.lossless {
             TX_4X4
         } else if plane == 0 {
             MAX_TX_SIZE_RECT[self.b.mi_size]
         } else {
-            let uv = MAX_TX_SIZE_RECT[self.f.plane_residual_size(self.b.mi_size, plane)];
-            uv
+            MAX_TX_SIZE_RECT[self.f.plane_residual_size(self.b.mi_size, plane)]
         };
         let x = (self.b.mi_col >> sub_x) * MI_SIZE;
         let y = (self.b.mi_row >> sub_y) * MI_SIZE;
-        let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
+        let sb_mask = if self.f.seq.use_128x128_superblock {
+            31
+        } else {
+            15
+        };
         let row = (y << sub_y) >> MI_SIZE_LOG2;
         let col = (x << sub_x) >> MI_SIZE_LOG2;
         let sbr = (row & sb_mask) >> sub_y;
@@ -166,7 +176,17 @@ impl TileDecoder<'_, '_> {
         };
         let ar = self.block_decoded(plane, sbr as isize - 1, (sbc + step_x) as isize);
         let bl = self.block_decoded(plane, (sbr + step_y) as isize, sbc as isize - 1);
-        (x, y, al, au, ar, bl, TX_WIDTH_LOG2[tx_sz], TX_HEIGHT_LOG2[tx_sz], tx_sz)
+        (
+            x,
+            y,
+            al,
+            au,
+            ar,
+            bl,
+            TX_WIDTH_LOG2[tx_sz],
+            TX_HEIGHT_LOG2[tx_sz],
+            tx_sz,
+        )
     }
 
     /// SATD between the source and `CurrFrame` over a region.
@@ -249,7 +269,8 @@ impl TileDecoder<'_, '_> {
             let pred_mv = self.b.ref_stack_mv[0][0];
             let nearest = self.b.ref_stack_mv[0][0];
             let global = self.b.global_mvs[0];
-            let mut cands: Vec<(usize, Mv, f64)> = vec![(NEARESTMV, nearest, 2.0), (GLOBALMV, global, 2.0)];
+            let mut cands: Vec<(usize, Mv, f64)> =
+                vec![(NEARESTMV, nearest, 2.0), (GLOBALMV, global, 2.0)];
             let searched = self.motion_search(pred_mv);
             let bits = 3.0 + mv_bits(searched[0] - pred_mv[0]) + mv_bits(searched[1] - pred_mv[1]);
             cands.push((NEWMV, searched, bits));
@@ -316,7 +337,11 @@ impl TileDecoder<'_, '_> {
         } else {
             1
         };
-        if TX_TYPE_IN_SET_INTRA[set][t] != 0 { t } else { DCT_DCT }
+        if TX_TYPE_IN_SET_INTRA[set][t] != 0 {
+            t
+        } else {
+            DCT_DCT
+        }
     }
 
     /// Whether the block, predicted from LAST_FRAME with `mv`, has an
@@ -353,14 +378,34 @@ impl TileDecoder<'_, '_> {
     fn inter_pred(&self, plane: usize, x: usize, y: usize, w: usize, h: usize, mv: Mv) -> Vec<i32> {
         let ref_idx = self.f.hdr.ref_frame_idx[0];
         let r = self.f.refs[ref_idx].as_ref().expect("LAST_FRAME");
-        let (sx, sy, stx, sty) = self.f.scale_mv(plane, r.upscaled_width as i32, r.frame_height as i32, x, y, mv);
+        let (sx, sy, stx, sty) = self.f.scale_mv(
+            plane,
+            r.upscaled_width as i32,
+            r.frame_height as i32,
+            x,
+            y,
+            mv,
+        );
         let (ssx, ssy) = self.f.plane_ss(plane);
         let last_x = ((r.upscaled_width as i32 + ssx as i32) >> ssx) - 1;
         let last_y = ((r.frame_height as i32 + ssy as i32) >> ssy) - 1;
         let rv = self.f.rounding_variables(false);
         let mut pred = vec![0i32; w * h];
         let filt = self.f.hdr.interpolation_filter as u8;
-        block_inter_prediction(&r.frame.planes[plane], last_x, last_y, sx, sy, stx, sty, w, h, [filt, filt], rv, &mut pred);
+        block_inter_prediction(
+            &r.frame.planes[plane],
+            last_x,
+            last_y,
+            sx,
+            sy,
+            stx,
+            sty,
+            w,
+            h,
+            [filt, filt],
+            rv,
+            &mut pred,
+        );
         pred
     }
 
@@ -401,7 +446,8 @@ impl TileDecoder<'_, '_> {
                 let row = rp.row(ry);
                 for j in 0..w as i32 {
                     let rx = (x0 + j + dx).clamp(0, last_x) as usize;
-                    s += (e.src(0, (x0 + j) as usize, (y0 + i) as usize) - row[rx] as i32).unsigned_abs() as u64;
+                    s += (e.src(0, (x0 + j) as usize, (y0 + i) as usize) - row[rx] as i32)
+                        .unsigned_abs() as u64;
                 }
                 if s >= best {
                     return s;
@@ -449,11 +495,24 @@ impl TileDecoder<'_, '_> {
         // Sub-sample refinement, in eighth samples: 4 then 2 (quarter).
         let mut best_cost = self.inter_satd(mv) as f64
             + lambda * (mv_bits(mv[0] - pred_mv[0]) + mv_bits(mv[1] - pred_mv[1]));
-        let min_step = if self.f.hdr.allow_high_precision_mv { 1 } else { 2 };
+        let min_step = if self.f.hdr.allow_high_precision_mv {
+            1
+        } else {
+            2
+        };
         let mut step = 4;
         while step >= min_step {
             let center = mv;
-            for (dy, dx) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+            for (dy, dx) in [
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (-1, 1),
+                (1, -1),
+                (1, 1),
+            ] {
                 let cand = [center[0] + dy * step, center[1] + dx * step];
                 let c = self.inter_satd(cand) as f64
                     + lambda * (mv_bits(cand[0] - pred_mv[0]) + mv_bits(cand[1] - pred_mv[1]));
@@ -470,7 +529,14 @@ impl TileDecoder<'_, '_> {
     /// Forward transforms and quantises the residual (source minus
     /// `CurrFrame`) of one transform block into `EncCtx::coefs`; returns the
     /// end of block in the scan of `tx_type`.
-    fn quantise_block(&mut self, plane: usize, x: usize, y: usize, tx_sz: usize, tx_type: usize) -> usize {
+    fn quantise_block(
+        &mut self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        tx_sz: usize,
+        tx_type: usize,
+    ) -> usize {
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
         let tw = w.min(32);
@@ -507,7 +573,11 @@ impl TileDecoder<'_, '_> {
         for i in 0..th {
             for j in 0..tw {
                 let v = c[i * w + j];
-                let (qs, dz) = if i == 0 && j == 0 { (dc_q, 0.5) } else { (ac_q, 0.62) };
+                let (qs, dz) = if i == 0 && j == 0 {
+                    (dc_q, 0.5)
+                } else {
+                    (ac_q, 0.62)
+                };
                 let a = v.abs() * denom / qs;
                 let l = (a + 1.0 - dz).floor().max(0.0).min(((1 << 20) - 1) as f64) as i32;
                 enc.coefs[i * tw + j] = if v < 0.0 { -l } else { l };
@@ -533,7 +603,13 @@ impl TileDecoder<'_, '_> {
 
     /// Chooses the levels of the transform block about to be coded (its
     /// prediction is in `CurrFrame`) and returns its end of block.
-    pub(crate) fn enc_choose_coeffs(&mut self, plane: usize, start_x: usize, start_y: usize, tx_sz: usize) -> usize {
+    pub(crate) fn enc_choose_coeffs(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) -> usize {
         let t = if self.b.lossless || TX_SIZE_SQR_UP[tx_sz] > TX_32X32 {
             DCT_DCT
         } else if plane == 0 {

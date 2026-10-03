@@ -16,7 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.quantizer = q.parse()?;
     }
     let mut enc = av1::Encoder::new(cfg);
-    let frame_len = av1::Frame::new(w, h, 8, av1::ChromaFormat::Yuv420).data.len();
+    let frame_len = av1::Frame::new(w, h, 8, av1::ChromaFormat::Yuv420)
+        .data
+        .len();
     let mut out = av1::ivf::IvfWriter::new(w as u16, h as u16, 30, 1);
     for (i, chunk) in data.chunks_exact(frame_len).enumerate() {
         let mut f = av1::Frame::new(w, h, 8, av1::ChromaFormat::Yuv420);

@@ -2,16 +2,20 @@
 //! coefficients and their contexts (8.3.2), transform types, and the
 //! reconstruct process (7.12.3).
 
+use crate::Result;
 use crate::consts::*;
-use crate::decoder::tile::{find_tx_size, TileDecoder};
+use crate::decoder::tile::{TileDecoder, find_tx_size};
 use crate::dsp::itx::inverse_transform_2d;
 use crate::tables::*;
-use crate::Result;
 
 impl TileDecoder<'_, '_> {
     /// `residual()`.
     pub(crate) fn residual(&mut self) -> Result<()> {
-        let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
+        let sb_mask = if self.f.seq.use_128x128_superblock {
+            31
+        } else {
+            15
+        };
         let ms = self.b.mi_size;
         let width_chunks = (block_width(ms) >> 6).max(1);
         let height_chunks = (block_height(ms) >> 6).max(1);
@@ -69,13 +73,25 @@ impl TileDecoder<'_, '_> {
     }
 
     /// `transform_block()`.
-    fn transform_block(&mut self, plane: usize, base_x: usize, base_y: usize, tx_sz: usize, x: usize, y: usize) -> Result<()> {
+    fn transform_block(
+        &mut self,
+        plane: usize,
+        base_x: usize,
+        base_y: usize,
+        tx_sz: usize,
+        x: usize,
+        y: usize,
+    ) -> Result<()> {
         let start_x = base_x + 4 * x;
         let start_y = base_y + 4 * y;
         let (sub_x, sub_y) = self.f.plane_ss(plane);
         let row = (start_y << sub_y) >> MI_SIZE_LOG2;
         let col = (start_x << sub_x) >> MI_SIZE_LOG2;
-        let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
+        let sb_mask = if self.f.seq.use_128x128_superblock {
+            31
+        } else {
+            15
+        };
         let sub_block_mi_row = row & sb_mask;
         let sub_block_mi_col = col & sb_mask;
         let step_x = TX_WIDTH[tx_sz] >> MI_SIZE_LOG2;
@@ -86,7 +102,9 @@ impl TileDecoder<'_, '_> {
             return Ok(());
         }
         if !self.b.is_inter {
-            if (plane == 0 && self.b.palette_size_y > 0) || (plane != 0 && self.b.palette_size_uv > 0) {
+            if (plane == 0 && self.b.palette_size_y > 0)
+                || (plane != 0 && self.b.palette_size_uv > 0)
+            {
                 self.predict_palette(plane, start_x, start_y, x, y, tx_sz);
             } else {
                 let is_cfl = plane > 0 && self.b.uv_mode == UV_CFL_PRED;
@@ -240,7 +258,13 @@ impl TileDecoder<'_, '_> {
     }
 
     /// `compute_tx_type( plane, txSz, blockX, blockY )`.
-    pub(crate) fn compute_tx_type(&self, plane: usize, tx_sz: usize, block_x: usize, block_y: usize) -> usize {
+    pub(crate) fn compute_tx_type(
+        &self,
+        plane: usize,
+        tx_sz: usize,
+        block_x: usize,
+        block_y: usize,
+    ) -> usize {
         let sqr_up = TX_SIZE_SQR_UP[tx_sz];
         if self.b.lossless || sqr_up > TX_32X32 {
             return DCT_DCT;
@@ -298,11 +322,15 @@ impl TileDecoder<'_, '_> {
                 };
                 if set == TX_SET_INTRA_1 {
                     let p = inv_index(&TX_TYPE_INTRA_INV_SET1, self.enc_tx_type);
-                    let s = self.sd.symbol(&mut self.cdf.intra_tx_type_set1[sqr][intra_dir], p);
+                    let s = self
+                        .sd
+                        .symbol(&mut self.cdf.intra_tx_type_set1[sqr][intra_dir], p);
                     TX_TYPE_INTRA_INV_SET1[s]
                 } else {
                     let p = inv_index(&TX_TYPE_INTRA_INV_SET2, self.enc_tx_type);
-                    let s = self.sd.symbol(&mut self.cdf.intra_tx_type_set2[sqr][intra_dir], p);
+                    let s = self
+                        .sd
+                        .symbol(&mut self.cdf.intra_tx_type_set2[sqr][intra_dir], p);
                     TX_TYPE_INTRA_INV_SET2[s]
                 }
             }
@@ -351,7 +379,10 @@ impl TileDecoder<'_, '_> {
             target_eob = self.enc_choose_coeffs(plane, start_x, start_y, tx_sz);
         }
         let ctx = self.all_zero_ctx(plane, tx_sz, x4, y4, w4, h4);
-        let all_zero = self.sd.symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx], (target_eob == 0) as usize) != 0;
+        let all_zero = self.sd.symbol(
+            &mut self.cdf.txb_skip[tx_sz_ctx][ctx],
+            (target_eob == 0) as usize,
+        ) != 0;
         if all_zero {
             if plane == 0 {
                 self.set_tx_types(x4, y4, tx_sz, DCT_DCT);
@@ -370,7 +401,11 @@ impl TileDecoder<'_, '_> {
             } else {
                 crate::bits::floor_log2(target_eob as u32 - 1) as usize + 2
             };
-            let t_rest = if t_pt >= 3 { target_eob - ((1 << (t_pt - 2)) + 1) } else { 0 };
+            let t_rest = if t_pt >= 3 {
+                target_eob - ((1 << (t_pt - 2)) + 1)
+            } else {
+                0
+            };
             let p = t_pt.saturating_sub(1);
             let eob_pt = 1 + match eob_multisize {
                 0 => self.sd.symbol(&mut self.cdf.eob_pt_16[ptype][ectx], p),
@@ -389,7 +424,9 @@ impl TileDecoder<'_, '_> {
             let eob_shift = eob_pt as i32 - 3;
             if eob_shift >= 0 {
                 let pe = (t_rest >> eob_shift.max(0)) & 1;
-                let eob_extra = self.sd.symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3], pe);
+                let eob_extra = self
+                    .sd
+                    .symbol(&mut self.cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3], pe);
                 if eob_extra != 0 {
                     eob += 1 << eob_shift;
                 }
@@ -409,12 +446,19 @@ impl TileDecoder<'_, '_> {
                 let mut level;
                 if c == eob - 1 {
                     let ctx = coeff_base_eob_ctx(c, bwl, height);
-                    let p = (self.enc_level(pos).min(3).max(1) - 1) as usize;
-                    level = self.sd.symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], p) as u32 + 1;
+                    let p = (self.enc_level(pos).clamp(1, 3) - 1) as usize;
+                    level = self
+                        .sd
+                        .symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], p)
+                        as u32
+                        + 1;
                 } else {
                     let ctx = self.coeff_base_ctx(tx_sz, tx_class, bwl, height, pos);
                     let p = self.enc_level(pos).min(3) as usize;
-                    level = self.sd.symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], p) as u32;
+                    level = self
+                        .sd
+                        .symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], p)
+                        as u32;
                 }
                 if level > NUM_BASE_LEVELS {
                     let br_ctx = self.coeff_br_ctx(tx_sz, tx_class, pos);
@@ -447,7 +491,7 @@ impl TileDecoder<'_, '_> {
                 };
                 if self.quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     // Encode mode: x = level - 14, coded as Exp-Golomb.
-                    let gx = (self.enc_level(pos).max(15) - 14) as u32;
+                    let gx = self.enc_level(pos).max(15) - 14;
                     let glen = crate::bits::floor_log2(gx) + 1;
                     let mut length = 0;
                     loop {
@@ -464,7 +508,8 @@ impl TileDecoder<'_, '_> {
                     for i in (0..length - 1).rev() {
                         x = (x << 1) | self.sd.literal(1, (gx >> i) & 1);
                     }
-                    self.quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64).min(i32::MAX as u64) as i32;
+                    self.quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64)
+                        .min(i32::MAX as u64) as i32;
                 }
                 if pos == 0 && self.quant[pos] > 0 {
                     dc_category = if sign != 0 { 1 } else { 2 };
@@ -488,7 +533,15 @@ impl TileDecoder<'_, '_> {
         eob
     }
 
-    fn all_zero_ctx(&self, plane: usize, tx_sz: usize, x4: usize, y4: usize, w4: usize, h4: usize) -> usize {
+    fn all_zero_ctx(
+        &self,
+        plane: usize,
+        tx_sz: usize,
+        x4: usize,
+        y4: usize,
+        w4: usize,
+        h4: usize,
+    ) -> usize {
         let mut max_x4 = self.f.mi_cols;
         let mut max_y4 = self.f.mi_rows;
         if plane > 0 {
@@ -551,7 +604,14 @@ impl TileDecoder<'_, '_> {
         }
     }
 
-    fn coeff_base_ctx(&self, tx_sz: usize, tx_class: usize, bwl: usize, height: usize, pos: usize) -> usize {
+    fn coeff_base_ctx(
+        &self,
+        tx_sz: usize,
+        tx_class: usize,
+        bwl: usize,
+        height: usize,
+        pos: usize,
+    ) -> usize {
         let width = 1usize << bwl;
         let row = pos >> bwl;
         let col = pos - (row << bwl);
@@ -559,8 +619,14 @@ impl TileDecoder<'_, '_> {
         for idx in 0..SIG_REF_DIFF_OFFSET_NUM {
             let ref_row = row as i32 + SIG_REF_DIFF_OFFSET[tx_class][idx][0];
             let ref_col = col as i32 + SIG_REF_DIFF_OFFSET[tx_class][idx][1];
-            if ref_row >= 0 && ref_col >= 0 && (ref_row as usize) < height && (ref_col as usize) < width {
-                mag += self.quant[((ref_row as usize) << bwl) + ref_col as usize].abs().min(3);
+            if ref_row >= 0
+                && ref_col >= 0
+                && (ref_row as usize) < height
+                && (ref_col as usize) < width
+            {
+                mag += self.quant[((ref_row as usize) << bwl) + ref_col as usize]
+                    .abs()
+                    .min(3);
             }
         }
         let ctx = ((mag + 1) >> 1).min(4) as usize;
@@ -585,7 +651,11 @@ impl TileDecoder<'_, '_> {
         for idx in 0..3 {
             let ref_row = row as i32 + MAG_REF_OFFSET_WITH_TX_CLASS[tx_class][idx][0];
             let ref_col = col as i32 + MAG_REF_OFFSET_WITH_TX_CLASS[tx_class][idx][1];
-            if ref_row >= 0 && ref_col >= 0 && (ref_row as usize) < txh && (ref_col as usize) < (1 << bwl) {
+            if ref_row >= 0
+                && ref_col >= 0
+                && (ref_row as usize) < txh
+                && (ref_col as usize) < (1 << bwl)
+            {
                 mag += self.quant[ref_row as usize * txw + ref_col as usize]
                     .min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as i32);
             }
@@ -594,7 +664,11 @@ impl TileDecoder<'_, '_> {
         if pos == 0 {
             mag
         } else if tx_class == 0 {
-            if row < 2 && col < 2 { mag + 7 } else { mag + 14 }
+            if row < 2 && col < 2 {
+                mag + 7
+            } else {
+                mag + 14
+            }
         } else if tx_class == 1 {
             if col == 0 { mag + 7 } else { mag + 14 }
         } else if row == 0 {
@@ -672,8 +746,14 @@ impl TileDecoder<'_, '_> {
         let tw = w.min(32);
         let th = h.min(32);
         let t = self.plane_tx_type;
-        let flip_ud = matches!(t, FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST);
-        let flip_lr = matches!(t, DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST);
+        let flip_ud = matches!(
+            t,
+            FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST
+        );
+        let flip_lr = matches!(
+            t,
+            DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST
+        );
         let qindex = self.qindex();
         let (dc_delta, ac_delta) = match plane {
             0 => (self.f.hdr.delta_q_y_dc, 0),
@@ -715,7 +795,14 @@ impl TileDecoder<'_, '_> {
                 dq[i * 64 + j] = 0;
             }
         }
-        inverse_transform_2d(&self.dequant[..], tx_sz, t, self.b.lossless, bd, &mut self.residual[..]);
+        inverse_transform_2d(
+            &self.dequant[..],
+            tx_sz,
+            t,
+            self.b.lossless,
+            bd,
+            &mut self.residual[..],
+        );
         let maxv = (1i32 << bd) - 1;
         let cur = &mut self.f.cur.planes[plane];
         for i in 0..h {
@@ -723,7 +810,11 @@ impl TileDecoder<'_, '_> {
             for j in 0..w {
                 let xx = if flip_lr { w - j - 1 } else { j };
                 let p = cur.get(x + xx, y + yy) as i32;
-                cur.set(x + xx, y + yy, (p + self.residual[i * w + j]).clamp(0, maxv) as u16);
+                cur.set(
+                    x + xx,
+                    y + yy,
+                    (p + self.residual[i * w + j]).clamp(0, maxv) as u16,
+                );
             }
         }
     }

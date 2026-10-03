@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use crate::cdf::CdfContext;
-use crate::header::FilmGrainParams;
 
 /// One plane of samples, 16 bits each whatever the bit depth.
 #[derive(Clone, Debug, Default)]
@@ -40,12 +39,6 @@ impl PlaneBuf {
     pub(crate) fn row(&self, y: usize) -> &[u16] {
         &self.data[y * self.stride..y * self.stride + self.w]
     }
-
-    pub(crate) fn row_mut(&mut self, y: usize) -> &mut [u16] {
-        let s = self.stride;
-        let w = self.w;
-        &mut self.data[y * s..y * s + w]
-    }
 }
 
 /// A frame's planes (one for monochrome, three otherwise).
@@ -79,9 +72,6 @@ pub(crate) struct Mi {
     pub(crate) delta_lf: [i8; 4],
     /// `RefFrames[ row ][ col ]` has been written for this frame.
     pub(crate) written: bool,
-    /// `MiRowStart`, `MiColStart`, `MiRowEnd`, `MiColEnd` of the tile the
-    /// block was decoded in (for CDEF's filter region).
-    pub(crate) tile: u16,
 }
 
 /// What a reference slot holds beyond the header state (7.20): the
@@ -90,7 +80,6 @@ pub(crate) struct RefData {
     pub(crate) frame: FrameBuf,
     pub(crate) frame_type: u32,
     pub(crate) upscaled_width: usize,
-    pub(crate) frame_width: usize,
     pub(crate) frame_height: usize,
     pub(crate) render_width: u32,
     pub(crate) render_height: u32,
@@ -109,8 +98,4 @@ pub(crate) struct RefData {
     pub(crate) saved_mvs: Arc<Vec<Mv>>,
     pub(crate) saved_segment_ids: Arc<Vec<u8>>,
     pub(crate) cdfs: Arc<CdfContext>,
-    pub(crate) film_grain: FilmGrainParams,
-    pub(crate) showable_frame: bool,
-    pub(crate) color_range: bool,
-    pub(crate) matrix_coefficients: u32,
 }

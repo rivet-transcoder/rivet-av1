@@ -22,11 +22,11 @@ use std::sync::Arc;
 
 use crate::bits::{BitReader, BitWriter};
 use crate::consts::*;
-use crate::decoder::tile::TileDecoder;
 use crate::decoder::Decoder;
+use crate::decoder::tile::TileDecoder;
 use crate::frame::{ChromaFormat, Frame};
 use crate::header::FrameHeader;
-use crate::obu::{write_obu, ColorConfig, SequenceHeader};
+use crate::obu::{ColorConfig, SequenceHeader, write_obu};
 use crate::tables::AC_QLOOKUP;
 use crate::{Error, Result};
 
@@ -170,12 +170,16 @@ impl Encoder {
             return Err(Error::invalid("frame size differs from the configuration"));
         }
         if frame.bit_depth != cfg.bit_depth || frame.chroma != ChromaFormat::Yuv420 {
-            return Err(Error::invalid("the encoder takes 4:2:0 frames of the configured bit depth"));
+            return Err(Error::invalid(
+                "the encoder takes 4:2:0 frames of the configured bit depth",
+            ));
         }
         if cfg.bit_depth != 8 && cfg.bit_depth != 10 {
             return Err(Error::invalid("bit depth must be 8 or 10"));
         }
-        let key = self.frame_num % cfg.keyframe_interval.max(1) as u64 == 0;
+        let key = self
+            .frame_num
+            .is_multiple_of(cfg.keyframe_interval.max(1) as u64);
         let qidx = self.quantizer();
         let header = self.write_frame_header(key, qidx);
         // Parse it back with the decoder's parser: the frame state is then
@@ -229,7 +233,13 @@ impl Encoder {
         self.q = (self.q + 12.0 * ratio.clamp(-2.0, 2.0)).clamp(1.0, 255.0);
     }
 
-    fn enc_ctx(&self, f: &crate::decoder::FrameCtx, frame: &Frame, key: bool, qidx: u32) -> Box<tile::EncCtx> {
+    fn enc_ctx(
+        &self,
+        f: &crate::decoder::FrameCtx,
+        frame: &Frame,
+        key: bool,
+        qidx: u32,
+    ) -> Box<tile::EncCtx> {
         let mut src = Vec::new();
         let mut stride = Vec::new();
         for p in 0..3 {
@@ -272,7 +282,10 @@ impl Encoder {
         w.flag(false); // disable_cdf_update
         // allow_screen_content_tools: seq_force_screen_content_tools = 0.
         w.flag(false); // frame_size_override_flag
-        w.f(seq.order_hint_bits, (self.frame_num & ((1 << seq.order_hint_bits) - 1)) as u32);
+        w.f(
+            seq.order_hint_bits,
+            (self.frame_num & ((1 << seq.order_hint_bits) - 1)) as u32,
+        );
         if !key {
             w.f(3, 0); // primary_ref_frame: LAST_FRAME's slot
             w.f(8, 1); // refresh_frame_flags: slot 0
@@ -318,7 +331,10 @@ impl Encoder {
         w.flag(false); // segmentation_enabled
         w.flag(false); // delta_q_present
         // loop_filter_params()
-        let lf = self.cfg.loop_filter.unwrap_or_else(|| ((qidx as f64) * 0.18 + 2.0).min(40.0) as u32);
+        let lf = self
+            .cfg
+            .loop_filter
+            .unwrap_or_else(|| ((qidx as f64) * 0.18 + 2.0).min(40.0) as u32);
         w.f(6, lf);
         w.f(6, lf);
         if lf != 0 {

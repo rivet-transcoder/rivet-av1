@@ -432,8 +432,8 @@ enum Kind {
 fn row_kind(tx_type: usize) -> Kind {
     match tx_type {
         DCT_DCT | ADST_DCT | FLIPADST_DCT | H_DCT => Kind::Dct,
-        DCT_ADST | ADST_ADST | DCT_FLIPADST | FLIPADST_FLIPADST | ADST_FLIPADST
-        | FLIPADST_ADST | H_ADST | H_FLIPADST => Kind::Adst,
+        DCT_ADST | ADST_ADST | DCT_FLIPADST | FLIPADST_FLIPADST | ADST_FLIPADST | FLIPADST_ADST
+        | H_ADST | H_FLIPADST => Kind::Adst,
         _ => Kind::Identity,
     }
 }
@@ -441,8 +441,8 @@ fn row_kind(tx_type: usize) -> Kind {
 fn col_kind(tx_type: usize) -> Kind {
     match tx_type {
         DCT_DCT | DCT_ADST | DCT_FLIPADST | V_DCT => Kind::Dct,
-        ADST_DCT | ADST_ADST | FLIPADST_DCT | FLIPADST_FLIPADST | ADST_FLIPADST
-        | FLIPADST_ADST | V_ADST | V_FLIPADST => Kind::Adst,
+        ADST_DCT | ADST_ADST | FLIPADST_DCT | FLIPADST_FLIPADST | ADST_FLIPADST | FLIPADST_ADST
+        | V_ADST | V_FLIPADST => Kind::Adst,
         _ => Kind::Identity,
     }
 }
@@ -498,7 +498,11 @@ pub(crate) fn inverse_transform_2d(
     let log2h = TX_HEIGHT_LOG2[tx_sz] as u32;
     let w = 1usize << log2w;
     let h = 1usize << log2h;
-    let row_shift = if lossless { 0 } else { TRANSFORM_ROW_SHIFT[tx_sz] as u32 };
+    let row_shift = if lossless {
+        0
+    } else {
+        TRANSFORM_ROW_SHIFT[tx_sz] as u32
+    };
     let col_shift = if lossless { 0 } else { 4 };
     let row_clamp = bit_depth + 8;
     let col_clamp = (bit_depth + 6).max(16);

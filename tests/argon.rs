@@ -31,7 +31,10 @@ fn cases(root: &Path) -> Vec<Case> {
     let Ok(rd) = std::fs::read_dir(root) else {
         return out;
     };
-    let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect();
+    let mut dirs: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
     dirs.sort();
     for dir in dirs {
         let dname = dir.file_name().unwrap().to_string_lossy().to_string();
@@ -50,7 +53,10 @@ fn cases(root: &Path) -> Vec<Case> {
             let Some(line) = cmd.lines().find(|l| l.contains("aomdec")) else {
                 return;
             };
-            let Some(input) = line.split_whitespace().find(|w| w.contains("ARGON_STREAMS_INPUT")) else {
+            let Some(input) = line
+                .split_whitespace()
+                .find(|w| w.contains("ARGON_STREAMS_INPUT"))
+            else {
                 return;
             };
             let file = input.rsplit('/').next().unwrap();
@@ -69,7 +75,10 @@ fn cases(root: &Path) -> Vec<Case> {
             });
         };
         if let Ok(rd) = std::fs::read_dir(&md5_dir) {
-            let mut v: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
+            let mut v: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+                .collect();
             v.sort();
             for p in v {
                 let stem = p.file_stem().unwrap().to_string_lossy().to_string();
@@ -90,7 +99,14 @@ fn cases(root: &Path) -> Vec<Case> {
                 for p in v {
                     let stem = p.file_stem().unwrap().to_string_lossy().to_string();
                     let label = format!("{dname}/layers/{n}/{stem}");
-                    push(p, cmd_dir.join("layers").join(&n).join(format!("{stem}_layer{n}.sh")), label);
+                    push(
+                        p,
+                        cmd_dir
+                            .join("layers")
+                            .join(&n)
+                            .join(format!("{stem}_layer{n}.sh")),
+                        label,
+                    );
                 }
             }
         }
@@ -121,7 +137,9 @@ fn run(c: &Case) -> Result<bool, String> {
                 let ch = f.height.div_ceil(2) as usize;
                 let mid = 1u16 << (f.bit_depth - 1);
                 let plane: Vec<u8> = if f.bit_depth > 8 {
-                    std::iter::repeat_n(mid.to_le_bytes(), cw * ch).flatten().collect()
+                    std::iter::repeat_n(mid.to_le_bytes(), cw * ch)
+                        .flatten()
+                        .collect()
                 } else {
                     vec![mid as u8; cw * ch]
                 };
@@ -225,7 +243,11 @@ fn argon() {
     let mut by_dir: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
     for (name, r) in &results {
         let dir = name.split('/').next().unwrap().to_string()
-            + if name.contains("/layers/") { "/layers" } else { "" };
+            + if name.contains("/layers/") {
+                "/layers"
+            } else {
+                ""
+            };
         let e = by_dir.entry(dir).or_default();
         e.1 += 1;
         let line = match r {

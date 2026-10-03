@@ -79,7 +79,11 @@ pub(crate) fn forward_2d(residual: &[i32], tx_sz: usize, tx_type: usize, out: &m
         }
     }
     // Columns.
-    let rect = if log2w.abs_diff(log2h) == 1 { 2896.0 / 4096.0 } else { 1.0 };
+    let rect = if log2w.abs_diff(log2h) == 1 {
+        2896.0 / 4096.0
+    } else {
+        1.0
+    };
     let gain = rect / (1u64 << (TRANSFORM_ROW_SHIFT[tx_sz] as u32 + 4)) as f64;
     for k in 0..h {
         for j in 0..w {
@@ -101,14 +105,18 @@ mod tests {
     /// Forward then the normative inverse returns the residual, near enough.
     #[test]
     fn round_trip() {
-        for tx_sz in [TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_8X16, TX_16X8, TX_4X8, TX_8X4] {
+        for tx_sz in [
+            TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_8X16, TX_16X8, TX_4X8, TX_8X4,
+        ] {
             for tx_type in [DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST, IDTX] {
                 if tx_sz == TX_32X32 && tx_type != DCT_DCT && tx_type != IDTX {
                     continue;
                 }
                 let w = 1usize << TX_WIDTH_LOG2[tx_sz];
                 let h = 1usize << TX_HEIGHT_LOG2[tx_sz];
-                let res: Vec<i32> = (0..w * h).map(|i| ((i * 37 + i / w * 11) % 61) as i32 - 30).collect();
+                let res: Vec<i32> = (0..w * h)
+                    .map(|i| ((i * 37 + i / w * 11) % 61) as i32 - 30)
+                    .collect();
                 let mut c = vec![0.0; w * h];
                 forward_2d(&res, tx_sz, tx_type, &mut c);
                 let mut dq = vec![0i32; 64 * 64];
@@ -119,7 +127,12 @@ mod tests {
                 }
                 let mut out = vec![0i32; w * h];
                 inverse_transform_2d(&dq, tx_sz, tx_type, false, 8, &mut out);
-                let err: i64 = out.iter().zip(&res).map(|(a, b)| ((a - b) as i64).abs()).max().unwrap();
+                let err: i64 = out
+                    .iter()
+                    .zip(&res)
+                    .map(|(a, b)| ((a - b) as i64).abs())
+                    .max()
+                    .unwrap();
                 assert!(err <= 2, "tx {tx_sz} type {tx_type}: max error {err}");
             }
         }

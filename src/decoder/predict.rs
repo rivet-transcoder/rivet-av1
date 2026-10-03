@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use crate::consts::*;
 use crate::decoder::state::{Mv, PlaneBuf};
-use crate::decoder::tile::{is_directional_mode, TileDecoder};
+use crate::decoder::tile::{TileDecoder, is_directional_mode};
 use crate::tables::*;
 
 /// Offset of index 0 in the edge arrays (indices down to -2 are used).
@@ -15,7 +15,11 @@ const EDGE_LEN: usize = EDGE_OFF + 2 * 129 + 16;
 impl TileDecoder<'_, '_> {
     /// `compute_prediction()` (5.11.33).
     pub(crate) fn compute_prediction(&mut self) {
-        let sb_mask = if self.f.seq.use_128x128_superblock { 31 } else { 15 };
+        let sb_mask = if self.f.seq.use_128x128_superblock {
+            31
+        } else {
+            15
+        };
         let sub_block_mi_row = self.b.mi_row & sb_mask;
         let sub_block_mi_col = self.b.mi_col & sb_mask;
         let planes = 1 + if self.b.has_chroma { 2 } else { 0 };
@@ -90,7 +94,15 @@ impl TileDecoder<'_, '_> {
                     let mut c = 0;
                     let mut x = 0;
                     while x < num4x4_w * 4 {
-                        self.predict_inter(plane, base_x + x, base_y + y, pred_w, pred_h, cand_row + r, cand_col + c);
+                        self.predict_inter(
+                            plane,
+                            base_x + x,
+                            base_y + y,
+                            pred_w,
+                            pred_h,
+                            cand_row + r,
+                            cand_col + c,
+                        );
                         x += pred_w;
                         c += 1;
                     }
@@ -167,7 +179,10 @@ impl TileDecoder<'_, '_> {
         if plane == 0 && self.b.use_filter_intra {
             self.recursive_intra(&above, &left, w, h, &mut pred, maxv);
         } else if is_directional_mode(mode) {
-            self.directional_intra(plane, x, y, have_left, have_above, mode, w, h, max_x, max_y, &mut above, &mut left, &mut pred, maxv);
+            self.directional_intra(
+                plane, x, y, have_left, have_above, mode, w, h, max_x, max_y, &mut above,
+                &mut left, &mut pred, maxv,
+            );
         } else if mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED {
             let wx = sm_weights(log2w);
             let wy = sm_weights(log2h);
@@ -176,7 +191,10 @@ impl TileDecoder<'_, '_> {
             for i in 0..h {
                 for j in 0..w {
                     let v = if mode == SMOOTH_PRED {
-                        let s = wy[i] * a(j) + (256 - wy[i]) * l(h - 1) + wx[j] * l(i) + (256 - wx[j]) * a(w - 1);
+                        let s = wy[i] * a(j)
+                            + (256 - wy[i]) * l(h - 1)
+                            + wx[j] * l(i)
+                            + (256 - wx[j]) * a(w - 1);
                         round2(s, 9)
                     } else if mode == SMOOTH_V_PRED {
                         round2(wy[i] * a(j) + (256 - wy[i]) * l(h - 1), 8)
@@ -243,7 +261,15 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The recursive intra prediction process (7.11.2.3).
-    fn recursive_intra(&self, above: &[i32], left: &[i32], w: usize, h: usize, pred: &mut [u16], maxv: i32) {
+    fn recursive_intra(
+        &self,
+        above: &[i32],
+        left: &[i32],
+        w: usize,
+        h: usize,
+        pred: &mut [u16],
+        maxv: i32,
+    ) {
         let w4 = w >> 2;
         let h2 = h >> 1;
         let mode = self.b.filter_intra_mode;
@@ -448,7 +474,15 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The palette prediction process (7.11.4).
-    pub(crate) fn predict_palette(&mut self, plane: usize, start_x: usize, start_y: usize, x: usize, y: usize, tx_sz: usize) {
+    pub(crate) fn predict_palette(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        x: usize,
+        y: usize,
+        tx_sz: usize,
+    ) {
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
         let palette = match plane {
@@ -456,7 +490,11 @@ impl TileDecoder<'_, '_> {
             1 => self.b.palette_colors_u,
             _ => self.b.palette_colors_v,
         };
-        let map = if plane == 0 { &self.color_map_y } else { &self.color_map_uv };
+        let map = if plane == 0 {
+            &self.color_map_y
+        } else {
+            &self.color_map_uv
+        };
         let cur = &mut self.f.cur.planes[plane];
         for i in 0..h {
             for j in 0..w {
@@ -467,7 +505,13 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The predict chroma from luma process (7.11.5).
-    pub(crate) fn predict_chroma_from_luma(&mut self, plane: usize, start_x: usize, start_y: usize, tx_sz: usize) {
+    pub(crate) fn predict_chroma_from_luma(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) {
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
         let sub_x = self.f.ssx;
@@ -497,21 +541,37 @@ impl TileDecoder<'_, '_> {
                 }
             }
         }
-        luma_avg = round2(luma_avg, (TX_WIDTH_LOG2[tx_sz] + TX_HEIGHT_LOG2[tx_sz]) as u32);
+        luma_avg = round2(
+            luma_avg,
+            (TX_WIDTH_LOG2[tx_sz] + TX_HEIGHT_LOG2[tx_sz]) as u32,
+        );
         let maxv = (1i32 << self.f.bit_depth) - 1;
         let cur = &mut self.f.cur.planes[plane];
         for i in 0..h {
             for j in 0..w {
                 let dc = cur.get(start_x + j, start_y + i) as i32;
                 let scaled = round2signed(alpha * (l[i * w + j] - luma_avg), 6);
-                cur.set(start_x + j, start_y + i, (dc + scaled).clamp(0, maxv) as u16);
+                cur.set(
+                    start_x + j,
+                    start_y + i,
+                    (dc + scaled).clamp(0, maxv) as u16,
+                );
             }
         }
     }
 
     /// The inter prediction process (7.11.3.1).
     #[allow(clippy::too_many_arguments)]
-    fn predict_inter(&mut self, plane: usize, x: usize, y: usize, w: usize, h: usize, cand_row: usize, cand_col: usize) {
+    fn predict_inter(
+        &mut self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        cand_row: usize,
+        cand_col: usize,
+    ) {
         let cand = *self.mi(cand_row, cand_col);
         let is_compound = cand.ref_frame[1] as i32 > INTRA_FRAME;
         let rv = self.f.rounding_variables(is_compound);
@@ -530,7 +590,11 @@ impl TileDecoder<'_, '_> {
             }
             let ref_frame = cand.ref_frame[ref_list] as i32;
             let mut global_valid = false;
-            let gm_ref = if ref_frame > INTRA_FRAME { ref_frame as usize } else { 0 };
+            let gm_ref = if ref_frame > INTRA_FRAME {
+                ref_frame as usize
+            } else {
+                0
+            };
             if (self.b.y_mode == GLOBALMV || self.b.y_mode == GLOBAL_GLOBALMV)
                 && self.f.hdr.gm_type[gm_ref] > TRANSLATION
             {
@@ -560,7 +624,19 @@ impl TileDecoder<'_, '_> {
                 };
                 for i8 in 0..=((h - 1) >> 3) {
                     for j8 in 0..=((w - 1) >> 3) {
-                        self.block_warp(&params, plane, ref_idx, x, y, i8, j8, w, h, &mut preds[ref_list], rv);
+                        self.block_warp(
+                            &params,
+                            plane,
+                            ref_idx,
+                            x,
+                            y,
+                            i8,
+                            j8,
+                            w,
+                            h,
+                            &mut preds[ref_list],
+                            rv,
+                        );
                     }
                 }
             } else if self.b.use_intrabc {
@@ -571,19 +647,43 @@ impl TileDecoder<'_, '_> {
                 );
                 let (sx, sy, stx, sty) = self.f.scale_mv(plane, uw, fh, x, y, mv);
                 let _ = fw;
-                let last_x = (((self.f.mi_cols * MI_SIZE) as i32 + self.f.plane_ss(plane).0 as i32)
+                let last_x = (((self.f.mi_cols * MI_SIZE) as i32
+                    + self.f.plane_ss(plane).0 as i32)
                     >> self.f.plane_ss(plane).0)
                     - 1;
-                let last_y = (((self.f.mi_rows * MI_SIZE) as i32 + self.f.plane_ss(plane).1 as i32)
+                let last_y = (((self.f.mi_rows * MI_SIZE) as i32
+                    + self.f.plane_ss(plane).1 as i32)
                     >> self.f.plane_ss(plane).1)
                     - 1;
                 let filt = cand.interp_filter;
                 let refp = &self.f.cur.planes[plane];
-                block_inter_prediction(refp, last_x, last_y, sx, sy, stx, sty, w, h, filt, rv, &mut preds[ref_list]);
+                block_inter_prediction(
+                    refp,
+                    last_x,
+                    last_y,
+                    sx,
+                    sy,
+                    stx,
+                    sty,
+                    w,
+                    h,
+                    filt,
+                    rv,
+                    &mut preds[ref_list],
+                );
             } else {
                 let ref_idx = self.f.hdr.ref_frame_idx[(ref_frame - LAST_FRAME) as usize];
-                let r = self.f.refs[ref_idx].clone().expect("reference checked at header");
-                let (sx, sy, stx, sty) = self.f.scale_mv(plane, r.upscaled_width as i32, r.frame_height as i32, x, y, mv);
+                let r = self.f.refs[ref_idx]
+                    .clone()
+                    .expect("reference checked at header");
+                let (sx, sy, stx, sty) = self.f.scale_mv(
+                    plane,
+                    r.upscaled_width as i32,
+                    r.frame_height as i32,
+                    x,
+                    y,
+                    mv,
+                );
                 let (ssx, ssy) = self.f.plane_ss(plane);
                 let last_x = ((r.upscaled_width as i32 + ssx as i32) >> ssx) - 1;
                 let last_y = ((r.frame_height as i32 + ssy as i32) >> ssy) - 1;
@@ -677,7 +777,17 @@ impl TileDecoder<'_, '_> {
 
     /// The mask blend process (7.11.3.14).
     #[allow(clippy::too_many_arguments)]
-    fn mask_blend(&mut self, preds: &[Vec<i32>; 2], plane: usize, dst_x: usize, dst_y: usize, w: usize, h: usize, post: u32, maxv: i32) {
+    fn mask_blend(
+        &mut self,
+        preds: &[Vec<i32>; 2],
+        plane: usize,
+        dst_x: usize,
+        dst_y: usize,
+        w: usize,
+        h: usize,
+        post: u32,
+        maxv: i32,
+    ) {
         let (sub_x, sub_y) = self.f.plane_ss(plane);
         let interintra = self.b.interintra;
         let wedge_interintra = self.b.wedge_interintra;
@@ -688,7 +798,10 @@ impl TileDecoder<'_, '_> {
                 let m = if (sub_x == 0 && sub_y == 0) || (interintra && !wedge_interintra) {
                     mask[yy * 128 + xx] as i32
                 } else if sub_x != 0 && sub_y == 0 {
-                    round2(mask[yy * 128 + 2 * xx] as i32 + mask[yy * 128 + 2 * xx + 1] as i32, 1)
+                    round2(
+                        mask[yy * 128 + 2 * xx] as i32 + mask[yy * 128 + 2 * xx + 1] as i32,
+                        1,
+                    )
                 } else {
                     round2(
                         mask[2 * yy * 128 + 2 * xx] as i32
@@ -701,7 +814,11 @@ impl TileDecoder<'_, '_> {
                 if interintra {
                     let pred0 = round2(preds[0][yy * w + xx], post).clamp(0, maxv);
                     let pred1 = cur.get(xx + dst_x, yy + dst_y) as i32;
-                    cur.set(xx + dst_x, yy + dst_y, round2(m * pred1 + (64 - m) * pred0, 6) as u16);
+                    cur.set(
+                        xx + dst_x,
+                        yy + dst_y,
+                        round2(m * pred1 + (64 - m) * pred0, 6) as u16,
+                    );
                 } else {
                     let pred0 = preds[0][yy * w + xx];
                     let pred1 = preds[1][yy * w + xx];
@@ -767,7 +884,9 @@ impl TileDecoder<'_, '_> {
                     let pred_w = w.min((step4 * MI_SIZE) >> sub_x);
                     let pred_h = (h >> 1).min(32 >> sub_y);
                     let mask = obmc_mask(pred_h);
-                    self.predict_overlap(plane, cand_row, cand_col, x4, y4, pred_w, pred_h, 0, mask);
+                    self.predict_overlap(
+                        plane, cand_row, cand_col, x4, y4, pred_w, pred_h, 0, mask,
+                    );
                 }
                 x4 += step4;
             }
@@ -788,7 +907,9 @@ impl TileDecoder<'_, '_> {
                     let pred_w = (w >> 1).min(32 >> sub_x);
                     let pred_h = h.min((step4 * MI_SIZE) >> sub_y);
                     let mask = obmc_mask(pred_w);
-                    self.predict_overlap(plane, cand_row, cand_col, x4, y4, pred_w, pred_h, 1, mask);
+                    self.predict_overlap(
+                        plane, cand_row, cand_col, x4, y4, pred_w, pred_h, 1, mask,
+                    );
                 }
                 y4 += step4;
             }
@@ -814,8 +935,17 @@ impl TileDecoder<'_, '_> {
         let (sub_x, sub_y) = self.f.plane_ss(plane);
         let pred_x = (x4 * 4) >> sub_x;
         let pred_y = (y4 * 4) >> sub_y;
-        let r = self.f.refs[ref_idx].clone().expect("reference checked at header");
-        let (sx, sy, stx, sty) = self.f.scale_mv(plane, r.upscaled_width as i32, r.frame_height as i32, pred_x, pred_y, mv);
+        let r = self.f.refs[ref_idx]
+            .clone()
+            .expect("reference checked at header");
+        let (sx, sy, stx, sty) = self.f.scale_mv(
+            plane,
+            r.upscaled_width as i32,
+            r.frame_height as i32,
+            pred_x,
+            pred_y,
+            mv,
+        );
         let last_x = ((r.upscaled_width as i32 + sub_x as i32) >> sub_x) - 1;
         let last_y = ((r.frame_height as i32 + sub_y as i32) >> sub_y) - 1;
         let rv = self.f.rounding_variables(false);
@@ -841,7 +971,11 @@ impl TileDecoder<'_, '_> {
                 let o = obmc_pred[i * pred_w + j].clamp(0, maxv);
                 let m = if pass == 0 { mask[i] } else { mask[j] };
                 let c = cur.get(pred_x + j, pred_y + i) as i32;
-                cur.set(pred_x + j, pred_y + i, round2(m * c + (64 - m) * o, 6) as u16);
+                cur.set(
+                    pred_x + j,
+                    pred_y + i,
+                    round2(m * c + (64 - m) * o, 6) as u16,
+                );
             }
         }
     }
@@ -923,8 +1057,14 @@ impl TileDecoder<'_, '_> {
             - (mid_x * (p[2] as i64 - (1 << WARPEDMODEL_PREC_BITS)) + mid_y * p[3] as i64);
         let vy = mvy * (1 << (WARPEDMODEL_PREC_BITS - 3))
             - (mid_x * p[4] as i64 + mid_y * (p[5] as i64 - (1 << WARPEDMODEL_PREC_BITS)));
-        p[0] = vx.clamp(-WARPEDMODEL_TRANS_CLAMP as i64, WARPEDMODEL_TRANS_CLAMP as i64 - 1) as i32;
-        p[1] = vy.clamp(-WARPEDMODEL_TRANS_CLAMP as i64, WARPEDMODEL_TRANS_CLAMP as i64 - 1) as i32;
+        p[0] = vx.clamp(
+            -WARPEDMODEL_TRANS_CLAMP as i64,
+            WARPEDMODEL_TRANS_CLAMP as i64 - 1,
+        ) as i32;
+        p[1] = vy.clamp(
+            -WARPEDMODEL_TRANS_CLAMP as i64,
+            WARPEDMODEL_TRANS_CLAMP as i64 - 1,
+        ) as i32;
     }
 
     /// The block warp process (7.11.3.5).
@@ -943,7 +1083,9 @@ impl TileDecoder<'_, '_> {
         pred: &mut [i32],
         rv: RoundingVars,
     ) {
-        let r = self.f.refs[ref_idx].as_ref().expect("reference checked at header");
+        let r = self.f.refs[ref_idx]
+            .as_ref()
+            .expect("reference checked at header");
         let refp = &r.frame.planes[plane];
         let (sub_x, sub_y) = self.f.plane_ss(plane);
         let last_x = ((r.upscaled_width as i64 + sub_x as i64) >> sub_x) - 1;
@@ -964,7 +1106,8 @@ impl TileDecoder<'_, '_> {
         for i1 in -7i64..8 {
             for i2 in -4i64..4 {
                 let sx = sx4 + alpha as i64 * i2 + beta as i64 * i1;
-                let offs = (round2_64(sx, WARPEDDIFF_PREC_BITS as u32) + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
+                let offs = (round2_64(sx, WARPEDDIFF_PREC_BITS as u32)
+                    + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
                 let mut s = 0i32;
                 let yy = (iy4 + i1).clamp(0, last_y) as usize;
                 for i3 in 0..8 {
@@ -979,10 +1122,12 @@ impl TileDecoder<'_, '_> {
         for i1 in -4i64..lim_i {
             for i2 in -4i64..lim_j {
                 let sy = sy4 + gamma as i64 * i2 + delta as i64 * i1;
-                let offs = (round2_64(sy, WARPEDDIFF_PREC_BITS as u32) + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
+                let offs = (round2_64(sy, WARPEDDIFF_PREC_BITS as u32)
+                    + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
                 let mut s = 0i32;
                 for i3 in 0..8 {
-                    s += WARPED_FILTERS[offs][i3] * intermediate[(i1 + i3 as i64 + 4) as usize][(i2 + 4) as usize];
+                    s += WARPED_FILTERS[offs][i3]
+                        * intermediate[(i1 + i3 as i64 + 4) as usize][(i2 + 4) as usize];
                 }
                 let py = (i8 as i64 * 8 + i1 + 4) as usize;
                 let px = (j8 as i64 * 8 + i2 + 4) as usize;
@@ -1029,7 +1174,15 @@ impl crate::decoder::FrameCtx {
     /// The motion vector scaling process (7.11.3.3): `startX`, `startY`,
     /// `stepX`, `stepY` for a reference of the given upscaled width and
     /// height.
-    pub(crate) fn scale_mv(&self, plane: usize, ref_upscaled_width: i32, ref_frame_height: i32, x: usize, y: usize, mv: Mv) -> (i64, i64, i64, i64) {
+    pub(crate) fn scale_mv(
+        &self,
+        plane: usize,
+        ref_upscaled_width: i32,
+        ref_frame_height: i32,
+        x: usize,
+        y: usize,
+        mv: Mv,
+    ) -> (i64, i64, i64, i64) {
         let fw = self.hdr.frame_width as i64;
         let fh = self.hdr.frame_height as i64;
         let x_scale = (((ref_upscaled_width as i64) << REF_SCALE_SHIFT) + fw / 2) / fw;
@@ -1066,7 +1219,8 @@ pub(crate) fn block_inter_prediction(
     rv: RoundingVars,
     pred: &mut [i32],
 ) {
-    let inter_h = ((((h as i64 - 1) * y_step + (1 << SCALE_SUBPEL_BITS) - 1) >> SCALE_SUBPEL_BITS) + 8) as usize;
+    let inter_h = ((((h as i64 - 1) * y_step + (1 << SCALE_SUBPEL_BITS) - 1) >> SCALE_SUBPEL_BITS)
+        + 8) as usize;
     let mut filt_x = interp_filter[1] as usize;
     if w <= 4 {
         if filt_x == EIGHTTAP as usize || filt_x == EIGHTTAP_SHARP as usize {
@@ -1122,7 +1276,9 @@ pub(crate) fn setup_shear(wp: &[i32; 6]) -> (bool, i32, i32, i32, i32) {
     let v = (wp[4] as i64) << WARPEDMODEL_PREC_BITS;
     let gamma0 = round2signed_64(v * div_factor, div_shift as u32).clamp(-32768, 32767) as i32;
     let w = wp[3] as i64 * wp[4] as i64;
-    let delta0 = (wp[5] as i64 - round2signed_64(w * div_factor, div_shift as u32) - (1 << WARPEDMODEL_PREC_BITS))
+    let delta0 = (wp[5] as i64
+        - round2signed_64(w * div_factor, div_shift as u32)
+        - (1 << WARPEDMODEL_PREC_BITS))
         .clamp(-32768, 32767) as i32;
     let rb = WARP_PARAM_REDUCE_BITS as u32;
     let alpha = round2signed(alpha0, rb) << rb;
@@ -1175,6 +1331,7 @@ fn sm_weights(log2: usize) -> &'static [i32] {
 }
 
 /// The intra edge filter strength selection process (7.11.2.9).
+#[allow(clippy::if_same_then_else)]
 fn intra_edge_filter_strength(w: i32, h: i32, filter_type: bool, delta: i32) -> usize {
     let d = delta.abs();
     let blk_wh = w + h;

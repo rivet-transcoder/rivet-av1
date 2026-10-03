@@ -21,8 +21,8 @@ use crate::bits::BitReader;
 use crate::cdf::CdfContext;
 use crate::consts::*;
 use crate::frame::{ChromaFormat, ColorInfo, Frame};
-use crate::header::{get_relative_dist, FrameHeader, RefHeaderState, RefState};
-use crate::obu::{split_obus, SequenceHeader};
+use crate::header::{FrameHeader, RefHeaderState, RefState, get_relative_dist};
+use crate::obu::{SequenceHeader, split_obus};
 use crate::tables::*;
 use crate::{Error, Result};
 use state::{FrameBuf, Mi, Mv, PlaneBuf, RefData};
@@ -170,13 +170,25 @@ impl Decoder {
         while pos < tu.len() {
             let (fu_size, n) = read_leb128(&tu[pos..])?;
             pos += n;
-            let end = pos.checked_add(fu_size).filter(|&e| e <= tu.len()).ok_or_else(|| Error::bitstream("frame_unit_size runs past the temporal unit"))?;
+            let end = pos
+                .checked_add(fu_size)
+                .filter(|&e| e <= tu.len())
+                .ok_or_else(|| Error::bitstream("frame_unit_size runs past the temporal unit"))?;
             while pos < end {
                 let (obu_len, n) = read_leb128(&tu[pos..end])?;
                 pos += n;
-                let obu_end = pos.checked_add(obu_len).filter(|&e| e <= end).ok_or_else(|| Error::bitstream("obu_length runs past the frame unit"))?;
+                let obu_end = pos
+                    .checked_add(obu_len)
+                    .filter(|&e| e <= end)
+                    .ok_or_else(|| Error::bitstream("obu_length runs past the frame unit"))?;
                 for obu in split_obus(&tu[pos..obu_end])? {
-                    self.decode_obu(obu.obu_type, obu.temporal_id, obu.spatial_id, obu.has_extension, obu.payload)?;
+                    self.decode_obu(
+                        obu.obu_type,
+                        obu.temporal_id,
+                        obu.spatial_id,
+                        obu.has_extension,
+                        obu.payload,
+                    )?;
                 }
                 pos = obu_end;
             }
@@ -195,21 +207,36 @@ impl Decoder {
     pub fn decode_all(&mut self, data: &[u8]) -> Result<Vec<Frame>> {
         self.shown.clear();
         for obu in split_obus(data)? {
-            self.decode_obu(obu.obu_type, obu.temporal_id, obu.spatial_id, obu.has_extension, obu.payload)?;
+            self.decode_obu(
+                obu.obu_type,
+                obu.temporal_id,
+                obu.spatial_id,
+                obu.has_extension,
+                obu.payload,
+            )?;
         }
         Ok(std::mem::take(&mut self.shown))
     }
 
-    fn decode_obu(&mut self, obu_type: u32, temporal_id: u32, spatial_id: u32, ext: bool, payload: &[u8]) -> Result<()> {
-        if obu_type != OBU_SEQUENCE_HEADER && obu_type != OBU_TEMPORAL_DELIMITER && ext {
-            if let Some(seq) = &self.seq {
-                let idc = seq.op_idc;
-                if idc != 0 {
-                    let in_t = (idc >> temporal_id) & 1;
-                    let in_s = (idc >> (spatial_id + 8)) & 1;
-                    if in_t == 0 || in_s == 0 {
-                        return Ok(());
-                    }
+    fn decode_obu(
+        &mut self,
+        obu_type: u32,
+        temporal_id: u32,
+        spatial_id: u32,
+        ext: bool,
+        payload: &[u8],
+    ) -> Result<()> {
+        if obu_type != OBU_SEQUENCE_HEADER
+            && obu_type != OBU_TEMPORAL_DELIMITER
+            && ext
+            && let Some(seq) = &self.seq
+        {
+            let idc = seq.op_idc;
+            if idc != 0 {
+                let in_t = (idc >> temporal_id) & 1;
+                let in_s = (idc >> (spatial_id + 8)) & 1;
+                if in_t == 0 || in_s == 0 {
+                    return Ok(());
                 }
             }
         }
@@ -234,7 +261,8 @@ impl Decoder {
                     .clone()
                     .ok_or_else(|| Error::bitstream("frame header before any sequence header"))?;
                 let mut r = BitReader::new(payload);
-                let hdr = FrameHeader::parse(&mut r, &seq, &mut self.ref_state, temporal_id, spatial_id)?;
+                let hdr =
+                    FrameHeader::parse(&mut r, &seq, &mut self.ref_state, temporal_id, spatial_id)?;
                 if hdr.show_existing_frame {
                     self.show_existing(seq, hdr)?;
                     self.seen_frame_header = false;
@@ -255,7 +283,9 @@ impl Decoder {
                 self.tile_group(payload)?;
             }
             OBU_TILE_LIST => {
-                return Err(Error::unsupported("large scale tile decoding (tile list OBUs)"));
+                return Err(Error::unsupported(
+                    "large scale tile decoding (tile list OBUs)",
+                ));
             }
             _ => {}
         }
@@ -264,10 +294,16 @@ impl Decoder {
 
     /// Sets up the frame state after `uncompressed_header()`: CDFs, the
     /// previous segment map, the motion field, the sample buffers.
-    pub(crate) fn setup_frame(&mut self, seq: Arc<SequenceHeader>, hdr: FrameHeader) -> Result<FrameCtx> {
+    pub(crate) fn setup_frame(
+        &mut self,
+        seq: Arc<SequenceHeader>,
+        hdr: FrameHeader,
+    ) -> Result<FrameCtx> {
         let c = &seq.color;
         if hdr.upscaled_width as u64 * hdr.frame_height as u64 > self.max_pixels {
-            return Err(Error::bitstream("frame larger than the decoder's pixel limit"));
+            return Err(Error::bitstream(
+                "frame larger than the decoder's pixel limit",
+            ));
         }
         let mi_rows = hdr.mi_rows;
         let mi_cols = hdr.mi_cols;
@@ -284,7 +320,11 @@ impl Decoder {
                     return Err(Error::bitstream("reference frame format differs"));
                 }
                 let (fw, fh) = (hdr.frame_width as usize, hdr.frame_height as usize);
-                if 2 * fw < r.upscaled_width || 2 * fh < r.frame_height || fw > 16 * r.upscaled_width || fh > 16 * r.frame_height {
+                if 2 * fw < r.upscaled_width
+                    || 2 * fh < r.frame_height
+                    || fw > 16 * r.upscaled_width
+                    || fh > 16 * r.frame_height
+                {
                     return Err(Error::bitstream("reference frame scale out of range"));
                 }
             }
@@ -305,10 +345,11 @@ impl Decoder {
         let mut prev_segment_ids = vec![0u8; n];
         if hdr.primary_ref_frame != PRIMARY_REF_NONE && hdr.segmentation_enabled {
             let idx = hdr.ref_frame_idx[hdr.primary_ref_frame];
-            if let Some(r) = &self.refs[idx] {
-                if r.mi_rows == mi_rows && r.mi_cols == mi_cols {
-                    prev_segment_ids.copy_from_slice(&r.saved_segment_ids);
-                }
+            if let Some(r) = &self.refs[idx]
+                && r.mi_rows == mi_rows
+                && r.mi_cols == mi_cols
+            {
+                prev_segment_ids.copy_from_slice(&r.saved_segment_ids);
             }
         }
         let ssx = c.subsampling_x as usize;
@@ -324,10 +365,16 @@ impl Decoder {
         let mut lr: [LrPlane; 3] = Default::default();
         for (plane, l) in lr.iter_mut().enumerate().take(num_planes) {
             if hdr.frame_restoration_type[plane] != RESTORE_NONE {
-                let (sx, sy) = if plane == 0 { (0, 0) } else { (ssx as u32, ssy as u32) };
+                let (sx, sy) = if plane == 0 {
+                    (0, 0)
+                } else {
+                    (ssx as u32, ssy as u32)
+                };
                 let unit_size = hdr.loop_restoration_size[plane];
-                l.unit_rows = count_units_in_frame(unit_size, round2(hdr.frame_height as i32, sy) as usize);
-                l.unit_cols = count_units_in_frame(unit_size, round2(hdr.upscaled_width as i32, sx) as usize);
+                l.unit_rows =
+                    count_units_in_frame(unit_size, round2(hdr.frame_height as i32, sy) as usize);
+                l.unit_cols =
+                    count_units_in_frame(unit_size, round2(hdr.upscaled_width as i32, sx) as usize);
                 let units = l.unit_rows * l.unit_cols;
                 l.lr_type = vec![RESTORE_NONE; units];
                 l.wiener = vec![[[0; 3]; 2]; units];
@@ -419,7 +466,9 @@ impl Decoder {
                 let mut td = TileDecoder::new(f, tile_data, tile_row, tile_col);
                 td.decode_tile()?;
                 let ok = td.sd.trailing_ok();
-                let saved = if !td.f.hdr.disable_frame_end_update_cdf && tile_num == ti.context_update_tile_id {
+                let saved = if !td.f.hdr.disable_frame_end_update_cdf
+                    && tile_num == ti.context_update_tile_id
+                {
                     Some(td.cdf)
                 } else {
                     None
@@ -429,7 +478,9 @@ impl Decoder {
             if !ok {
                 f.tiles_ok = false;
                 if self.strict {
-                    return Err(Error::bitstream(format!("tile {tile_num} does not end with its padding")));
+                    return Err(Error::bitstream(format!(
+                        "tile {tile_num} does not end with its padding"
+                    )));
                 }
             }
             if saved.is_some() {
@@ -448,12 +499,12 @@ impl Decoder {
     /// After the last tile: `frame_end_update_cdf()` and the decode frame
     /// wrapup process.
     pub(crate) fn finish_frame(&mut self, mut f: FrameCtx) -> Result<()> {
-        if !f.hdr.disable_frame_end_update_cdf {
-            if let Some(s) = f.saved_cdfs.take() {
-                // frame_end_update_cdf(); the counters do not matter: every
-                // load clears them.
-                f.cdfs = s;
-            }
+        if !f.hdr.disable_frame_end_update_cdf
+            && let Some(s) = f.saved_cdfs.take()
+        {
+            // frame_end_update_cdf(); the counters do not matter: every
+            // load clears them.
+            f.cdfs = s;
         }
         self.decode_frame_wrapup(f)
     }
@@ -483,7 +534,6 @@ impl Decoder {
             frame: lr,
             frame_type: h.frame_type,
             upscaled_width: h.upscaled_width as usize,
-            frame_width: h.frame_width as usize,
             frame_height: h.frame_height as usize,
             render_width: h.render_width,
             render_height: h.render_height,
@@ -498,32 +548,20 @@ impl Decoder {
             saved_mvs: Arc::new(mf_mvs),
             saved_segment_ids: Arc::new(std::mem::take(&mut f.segment_ids)),
             cdfs: Arc::new(*f.cdfs),
-            film_grain: film_grain.clone(),
-            showable_frame: h.showable_frame,
-            color_range: seq.color.color_range,
-            matrix_coefficients: seq.color.matrix_coefficients,
         });
         let hs = Arc::new(RefHeaderState {
             frame_id: h.current_frame_id,
             frame_type: h.frame_type,
             upscaled_width: h.upscaled_width,
-            frame_width: h.frame_width,
             frame_height: h.frame_height,
             render_width: h.render_width,
             render_height: h.render_height,
-            mi_cols: f.mi_cols as u32,
-            mi_rows: f.mi_rows as u32,
             loop_filter_ref_deltas: h.loop_filter_ref_deltas,
             loop_filter_mode_deltas: h.loop_filter_mode_deltas,
             feature_enabled: h.feature_enabled,
             feature_data: h.feature_data,
             gm_params: h.gm_params,
             film_grain,
-            saved_order_hints: h.order_hints,
-            bit_depth: f.bit_depth,
-            subsampling_x: f.ssx as u32,
-            subsampling_y: f.ssy as u32,
-            showable_frame: h.showable_frame,
         });
         // The reference frame update process (7.20).
         for i in 0..NUM_REF_FRAMES {
@@ -570,7 +608,12 @@ impl Decoder {
     }
 
     /// The output process (7.18): the intermediate output and film grain.
-    fn output(&self, seq: &SequenceHeader, data: &RefData, grain: &crate::header::FilmGrainParams) -> Frame {
+    fn output(
+        &self,
+        seq: &SequenceHeader,
+        data: &RefData,
+        grain: &crate::header::FilmGrainParams,
+    ) -> Frame {
         let w = data.upscaled_width;
         let h = data.frame_height;
         let mono = seq.color.mono_chrome;
@@ -605,7 +648,16 @@ impl Decoder {
             planes.push(v);
         }
         if seq.film_grain_params_present && grain.apply_grain {
-            grain::apply(seq, data.bit_depth, data.subsampling_x as usize, data.subsampling_y as usize, w, h, grain, &mut planes);
+            grain::apply(
+                seq,
+                data.bit_depth,
+                data.subsampling_x as usize,
+                data.subsampling_y as usize,
+                w,
+                h,
+                grain,
+                &mut planes,
+            );
         }
         for (p, v) in planes.iter().enumerate() {
             let pl = frame.planes[p];
@@ -637,10 +689,14 @@ impl Decoder {
         }
         let mut ref_stamp = MFMV_STACK_SIZE - 2;
         let dist = |a: u32, b: u32| get_relative_dist(&seq, a, b);
-        if dist(h.order_hints[BWDREF_FRAME as usize], h.order_hint) > 0 && self.project(f, BWDREF_FRAME, 1) {
+        if dist(h.order_hints[BWDREF_FRAME as usize], h.order_hint) > 0
+            && self.project(f, BWDREF_FRAME, 1)
+        {
             ref_stamp -= 1;
         }
-        if dist(h.order_hints[ALTREF2_FRAME as usize], h.order_hint) > 0 && self.project(f, ALTREF2_FRAME, 1) {
+        if dist(h.order_hints[ALTREF2_FRAME as usize], h.order_hint) > 0
+            && self.project(f, ALTREF2_FRAME, 1)
+        {
             ref_stamp -= 1;
         }
         if dist(h.order_hints[ALTREF_FRAME as usize], h.order_hint) > 0
@@ -681,7 +737,10 @@ impl Decoder {
                     continue;
                 }
                 let ref_to_cur = dist(order_hints[src as usize], order_hint);
-                let ref_offset = dist(order_hints[src as usize], r.saved_order_hints[src_ref as usize]);
+                let ref_offset = dist(
+                    order_hints[src as usize],
+                    r.saved_order_hints[src_ref as usize],
+                );
                 let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
                     && ref_offset.abs() <= MAX_FRAME_DISTANCE
                     && ref_offset > 0;
@@ -721,7 +780,11 @@ impl Decoder {
                     let r = m.ref_frame[list] as i32;
                     if r > INTRA_FRAME {
                         let ref_idx = f.hdr.ref_frame_idx[(r - LAST_FRAME) as usize];
-                        let dist = get_relative_dist(seq, self.ref_state.order_hint[ref_idx], f.hdr.order_hint);
+                        let dist = get_relative_dist(
+                            seq,
+                            self.ref_state.order_hint[ref_idx],
+                            f.hdr.order_hint,
+                        );
                         if dist < 0 {
                             let mv = m.mv[list];
                             if mv[0].abs() <= REFMVS_LIMIT && mv[1].abs() <= REFMVS_LIMIT {
@@ -741,7 +804,9 @@ impl Decoder {
 fn read_leb128(d: &[u8]) -> Result<(usize, usize)> {
     let mut value: u64 = 0;
     for i in 0..8 {
-        let b = *d.get(i).ok_or_else(|| Error::bitstream("leb128 runs past the data"))? as u64;
+        let b = *d
+            .get(i)
+            .ok_or_else(|| Error::bitstream("leb128 runs past the data"))? as u64;
         value |= (b & 0x7f) << (i * 7);
         if b & 0x80 == 0 {
             return Ok((value as usize, i + 1));
@@ -758,7 +823,10 @@ pub fn annexb_temporal_units(data: &[u8]) -> Result<Vec<&[u8]>> {
     while pos < data.len() {
         let (sz, n) = read_leb128(&data[pos..])?;
         pos += n;
-        let end = pos.checked_add(sz).filter(|&e| e <= data.len()).ok_or_else(|| Error::bitstream("temporal_unit_size runs past the data"))?;
+        let end = pos
+            .checked_add(sz)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| Error::bitstream("temporal_unit_size runs past the data"))?;
         out.push(&data[pos..end]);
         pos = end;
     }

@@ -172,25 +172,6 @@ impl CdfContext {
             }
         }
     }
-
-    /// Replaces the coefficient CDFs with the defaults for `base_q_idx`
-    /// (`init_coeff_cdfs`), keeping the others.
-    pub(crate) fn init_coeff_cdfs(&mut self, base_q_idx: u32) {
-        let fresh = CdfContext::new(base_q_idx);
-        self.txb_skip = fresh.txb_skip;
-        self.eob_pt_16 = fresh.eob_pt_16;
-        self.eob_pt_32 = fresh.eob_pt_32;
-        self.eob_pt_64 = fresh.eob_pt_64;
-        self.eob_pt_128 = fresh.eob_pt_128;
-        self.eob_pt_256 = fresh.eob_pt_256;
-        self.eob_pt_512 = fresh.eob_pt_512;
-        self.eob_pt_1024 = fresh.eob_pt_1024;
-        self.eob_extra = fresh.eob_extra;
-        self.dc_sign = fresh.dc_sign;
-        self.coeff_base_eob = fresh.coeff_base_eob;
-        self.coeff_base = fresh.coeff_base;
-        self.coeff_br = fresh.coeff_br;
-    }
 }
 
 fn palette_colors(luma: bool) -> [[[u16; 9]; 5]; 7] {
@@ -221,6 +202,10 @@ fn palette_colors(luma: bool) -> [[[u16; 9]; 5]; 7] {
 }
 
 /// The live part of a palette color CDF row: `PaletteSize + 1` entries.
-pub(crate) fn palette_color_cdf(rows: &mut [[[u16; 9]; 5]; 7], size: usize, ctx: usize) -> &mut [u16] {
+pub(crate) fn palette_color_cdf(
+    rows: &mut [[[u16; 9]; 5]; 7],
+    size: usize,
+    ctx: usize,
+) -> &mut [u16] {
     &mut rows[size - 2][ctx][..size + 1]
 }

@@ -22,10 +22,6 @@ impl<'a> BitReader<'a> {
         self.pos
     }
 
-    pub(crate) fn data(&self) -> &'a [u8] {
-        self.data
-    }
-
     pub(crate) fn bit(&mut self) -> Result<u32> {
         let byte = self.pos >> 3;
         if byte >= self.data.len() {
@@ -90,15 +86,6 @@ impl<'a> BitReader<'a> {
         Ok((v + (1u64 << lz) - 1) as u32)
     }
 
-    /// `le(n)`: n little-endian bytes (byte aligned).
-    pub(crate) fn le(&mut self, n: u32) -> Result<u32> {
-        let mut t: u64 = 0;
-        for i in 0..n {
-            t |= (self.f(8)? as u64) << (i * 8);
-        }
-        Ok(t as u32)
-    }
-
     /// `leb128()`.
     pub(crate) fn leb128(&mut self) -> Result<u64> {
         let mut value: u64 = 0;
@@ -118,10 +105,6 @@ impl<'a> BitReader<'a> {
             self.bit()?;
         }
         Ok(())
-    }
-
-    pub(crate) fn skip_bits(&mut self, n: usize) {
-        self.pos += n;
     }
 }
 
@@ -178,31 +161,6 @@ impl BitWriter {
         self.bit(b as u32);
     }
 
-    /// `su(n)`.
-    pub(crate) fn su(&mut self, n: u32, v: i32) {
-        self.f(n, (v as u32) & ((1u64 << n) - 1) as u32);
-    }
-
-    /// `ns(n)`.
-    pub(crate) fn ns(&mut self, n: u32, v: u32) {
-        if n <= 1 {
-            return;
-        }
-        let w = floor_log2(n) + 1;
-        let m = (1u32 << w) - n;
-        if v < m {
-            self.f(w - 1, v);
-        } else {
-            let t = v + m;
-            self.f(w - 1, t >> 1);
-            self.f(1, t & 1);
-        }
-    }
-
-    pub(crate) fn bit_position(&self) -> usize {
-        self.out.len() * 8 + self.nbits as usize
-    }
-
     /// `trailing_bits()`: a one, then zeros to the byte boundary.
     pub(crate) fn trailing_bits(&mut self) {
         self.bit(1);
@@ -245,17 +203,11 @@ mod tests {
     fn round_trip() {
         let mut w = BitWriter::new();
         w.f(3, 5);
-        w.su(7, -20);
-        w.ns(5, 3);
-        w.ns(5, 1);
         w.f(32, 0xdead_beef);
         w.trailing_bits();
         let d = w.finish();
         let mut r = BitReader::new(&d);
         assert_eq!(r.f(3).unwrap(), 5);
-        assert_eq!(r.su(7).unwrap(), -20);
-        assert_eq!(r.ns(5).unwrap(), 3);
-        assert_eq!(r.ns(5).unwrap(), 1);
         assert_eq!(r.f(32).unwrap(), 0xdead_beef);
     }
 

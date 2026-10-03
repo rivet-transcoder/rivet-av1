@@ -49,24 +49,15 @@ pub(crate) struct RefHeaderState {
     pub(crate) frame_id: u32,
     pub(crate) frame_type: u32,
     pub(crate) upscaled_width: u32,
-    pub(crate) frame_width: u32,
     pub(crate) frame_height: u32,
     pub(crate) render_width: u32,
     pub(crate) render_height: u32,
-    pub(crate) mi_cols: u32,
-    pub(crate) mi_rows: u32,
     pub(crate) loop_filter_ref_deltas: [i32; 8],
     pub(crate) loop_filter_mode_deltas: [i32; 2],
     pub(crate) feature_enabled: [[bool; 8]; 8],
     pub(crate) feature_data: [[i32; 8]; 8],
     pub(crate) gm_params: [[i32; 6]; 8],
     pub(crate) film_grain: FilmGrainParams,
-    /// `SavedOrderHints[ i ]`.
-    pub(crate) saved_order_hints: [u32; 8],
-    pub(crate) bit_depth: u32,
-    pub(crate) subsampling_x: u32,
-    pub(crate) subsampling_y: u32,
-    pub(crate) showable_frame: bool,
 }
 
 /// The reference-slot state that header parsing reads and updates:
@@ -183,17 +174,9 @@ pub(crate) struct FrameHeader {
     pub(crate) gm_type: [u32; 8],
     pub(crate) gm_params: [[i32; 6]; 8],
     pub(crate) film_grain: FilmGrainParams,
-    /// Size in bytes of the header, as read (to locate the tile data of an
-    /// OBU_FRAME).
-    pub(crate) header_bytes: usize,
 }
 
-impl FrameHeader {
-    /// `get_relative_dist( a, b )`.
-    pub(crate) fn rel_dist(seq: &SequenceHeader, a: u32, b: u32) -> i32 {
-        get_relative_dist(seq, a, b)
-    }
-}
+impl FrameHeader {}
 
 /// `get_relative_dist( a, b )` (5.9.3).
 pub(crate) fn get_relative_dist(seq: &SequenceHeader, a: u32, b: u32) -> i32 {
@@ -333,11 +316,12 @@ impl Parser<'_, '_> {
         }
         h.disable_cdf_update = self.r.flag()?;
         let h = &mut self.h;
-        h.allow_screen_content_tools = if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
-            self.r.flag()?
-        } else {
-            seq.seq_force_screen_content_tools != 0
-        };
+        h.allow_screen_content_tools =
+            if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
+                self.r.flag()?
+            } else {
+                seq.seq_force_screen_content_tools != 0
+            };
         let h = &mut self.h;
         if h.allow_screen_content_tools {
             h.force_integer_mv = if seq.seq_force_integer_mv == SELECT_INTEGER_MV {
@@ -502,7 +486,9 @@ impl Parser<'_, '_> {
             self.h.loop_filter_ref_deltas = DEFAULT_REF_DELTAS;
             self.h.loop_filter_mode_deltas = [0; 2];
         } else {
-            let prev = self.slot(self.h.ref_frame_idx[self.h.primary_ref_frame])?.clone();
+            let prev = self
+                .slot(self.h.ref_frame_idx[self.h.primary_ref_frame])?
+                .clone();
             self.prev_gm_params = prev.gm_params;
             self.h.loop_filter_ref_deltas = prev.loop_filter_ref_deltas;
             self.h.loop_filter_mode_deltas = prev.loop_filter_mode_deltas;
@@ -749,8 +735,16 @@ impl Parser<'_, '_> {
         let mi_cols = self.h.mi_cols as u32;
         let mi_rows = self.h.mi_rows as u32;
         let sb128 = seq.use_128x128_superblock;
-        let sb_cols = if sb128 { (mi_cols + 31) >> 5 } else { (mi_cols + 15) >> 4 };
-        let sb_rows = if sb128 { (mi_rows + 31) >> 5 } else { (mi_rows + 15) >> 4 };
+        let sb_cols = if sb128 {
+            (mi_cols + 31) >> 5
+        } else {
+            (mi_cols + 15) >> 4
+        };
+        let sb_rows = if sb128 {
+            (mi_rows + 31) >> 5
+        } else {
+            (mi_rows + 15) >> 4
+        };
         let sb_shift = if sb128 { 5 } else { 4 };
         let sb_size = sb_shift + 2;
         let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
@@ -841,11 +835,7 @@ impl Parser<'_, '_> {
     }
 
     fn read_delta_q(&mut self) -> Result<i32> {
-        if self.r.flag()? {
-            self.r.su(7)
-        } else {
-            Ok(0)
-        }
+        if self.r.flag()? { self.r.su(7) } else { Ok(0) }
     }
 
     fn quantization_params(&mut self) -> Result<()> {
@@ -1044,14 +1034,12 @@ impl Parser<'_, '_> {
                 }
             }
             let s0 = RESTORATION_TILESIZE_MAX >> (2 - lr_unit_shift);
-            let lr_uv_shift = if seq.color.subsampling_x != 0
-                && seq.color.subsampling_y != 0
-                && uses_chroma_lr
-            {
-                self.r.f(1)?
-            } else {
-                0
-            };
+            let lr_uv_shift =
+                if seq.color.subsampling_x != 0 && seq.color.subsampling_y != 0 && uses_chroma_lr {
+                    self.r.f(1)?
+                } else {
+                    0
+                };
             self.h.loop_restoration_size = [s0, s0 >> lr_uv_shift, s0 >> lr_uv_shift];
         }
         Ok(())
@@ -1121,7 +1109,11 @@ impl Parser<'_, '_> {
         for rf in LAST_FRAME as usize..=ALTREF_FRAME as usize {
             self.h.gm_type[rf] = IDENTITY;
             for i in 0..6 {
-                self.h.gm_params[rf][i] = if i % 3 == 2 { 1 << WARPEDMODEL_PREC_BITS } else { 0 };
+                self.h.gm_params[rf][i] = if i % 3 == 2 {
+                    1 << WARPEDMODEL_PREC_BITS
+                } else {
+                    0
+                };
             }
         }
         if self.h.frame_is_intra {
@@ -1173,7 +1165,11 @@ impl Parser<'_, '_> {
             }
         }
         let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
-        let round = if idx % 3 == 2 { 1i32 << WARPEDMODEL_PREC_BITS } else { 0 };
+        let round = if idx % 3 == 2 {
+            1i32 << WARPEDMODEL_PREC_BITS
+        } else {
+            0
+        };
         let sub = if idx % 3 == 2 { 1i32 << prec_bits } else { 0 };
         let mx = 1i32 << abs_bits;
         let r = (self.prev_gm_params[rf][idx] >> prec_diff) - sub;
