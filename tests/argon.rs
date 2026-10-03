@@ -107,7 +107,7 @@ fn cases(root: &Path) -> Vec<Case> {
                         cmd_dir
                             .join("layers")
                             .join(&n)
-                            .join(format!("{stem}_layer{n}.sh")),
+                            .join(format!("{stem}.sh")),
                         label,
                     );
                 }
