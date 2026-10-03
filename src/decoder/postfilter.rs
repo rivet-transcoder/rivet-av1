@@ -432,15 +432,6 @@ fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
     (y_dir, var)
 }
 
-fn constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
-    if threshold == 0 {
-        return 0;
-    }
-    let damping_adj = (damping - floor_log2(threshold as u32) as i32).max(0);
-    let mag = clip3(0, diff.abs(), threshold - (diff.abs() >> damping_adj));
-    if diff < 0 { -mag } else { mag }
-}
-
 /// The CDEF filter process (7.15.3).
 #[allow(clippy::too_many_arguments)]
 fn cdef_filter(
@@ -454,46 +445,124 @@ fn cdef_filter(
     damping: i32,
     dir: usize,
 ) {
-    let coeff_shift = f.bit_depth - 8;
     let (sub_x, sub_y) = f.plane_ss(plane);
     let x0 = (c * MI_SIZE) >> sub_x;
     let y0 = (r * MI_SIZE) >> sub_y;
     let w = 8 >> sub_x;
     let h = 8 >> sub_y;
-    let src = &f.cur.planes[plane];
-    let mi_rows = f.mi_rows as i32;
-    let mi_cols = f.mi_cols as i32;
-    let get = |i: usize, j: usize, dir: usize, k: usize, sign: i32| -> Option<i32> {
-        let y = y0 as i32 + i as i32 + sign * CDEF_DIRECTIONS[dir][k][0];
-        let x = x0 as i32 + j as i32 + sign * CDEF_DIRECTIONS[dir][k][1];
-        let cand_r = (y << sub_y) >> MI_SIZE_LOG2;
-        let cand_c = (x << sub_x) >> MI_SIZE_LOG2;
-        if cand_r >= 0 && cand_r < mi_rows && cand_c >= 0 && cand_c < mi_cols {
-            Some(src.get(x as usize, y as usize) as i32)
-        } else {
-            None
-        }
-    };
-    let pri_taps = &CDEF_PRI_TAPS[((pri_str >> coeff_shift) & 1) as usize];
-    let sec_taps = &CDEF_SEC_TAPS[((pri_str >> coeff_shift) & 1) as usize];
+    let xlim = (f.mi_cols * MI_SIZE) >> sub_x;
+    let ylim = (f.mi_rows * MI_SIZE) >> sub_y;
+    let mut res = [0u16; 64];
+    cdef_filter_block(
+        &f.cur.planes[plane],
+        x0,
+        y0,
+        w,
+        h,
+        xlim,
+        ylim,
+        pri_str,
+        sec_str,
+        damping,
+        dir,
+        f.bit_depth - 8,
+        &mut res,
+    );
     let dst = &mut out.planes[plane];
     for i in 0..h {
+        let o = (y0 + i) * dst.stride + x0;
+        dst.data[o..o + w].copy_from_slice(&res[i * w..(i + 1) * w]);
+    }
+}
+
+/// A sample outside the frame: not a CDEF tap (`CdefAvailable` is 0).
+const CDEF_NA: i32 = i32::MIN;
+
+/// The CDEF filter process (7.15.3) of one `w` x `h` block of a plane at
+/// `(x0, y0)`, reading `src` (samples at or beyond `xlim` / `ylim`, the
+/// frame's mode info edge in this plane, are unavailable) and writing the
+/// filtered block to `res` (row stride `w`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cdef_filter_block(
+    src: &PlaneBuf,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    xlim: usize,
+    ylim: usize,
+    pri_str: i32,
+    sec_str: i32,
+    damping: i32,
+    dir: usize,
+    coeff_shift: u32,
+    res: &mut [u16; 64],
+) {
+    // The block with a border of 2, unavailable samples marked.
+    const B: usize = 2;
+    const WS: usize = 8 + 2 * B;
+    let mut win = [CDEF_NA; WS * WS];
+    for i in 0..h + 2 * B {
+        let y = y0 as isize + i as isize - B as isize;
+        if y < 0 || y as usize >= ylim {
+            continue;
+        }
+        let row = &src.data[y as usize * src.stride..];
+        for j in 0..w + 2 * B {
+            let x = x0 as isize + j as isize - B as isize;
+            if x >= 0 && (x as usize) < xlim {
+                win[i * WS + j] = row[x as usize] as i32;
+            }
+        }
+    }
+    let pri_taps = &CDEF_PRI_TAPS[((pri_str >> coeff_shift) & 1) as usize];
+    let sec_taps = &CDEF_SEC_TAPS[((pri_str >> coeff_shift) & 1) as usize];
+    let pri_adj = if pri_str != 0 {
+        (damping - floor_log2(pri_str as u32) as i32).max(0)
+    } else {
+        0
+    };
+    let sec_adj = if sec_str != 0 {
+        (damping - floor_log2(sec_str as u32) as i32).max(0)
+    } else {
+        0
+    };
+    // Window offsets of the taps: primary (k, +/-), secondary (k, +/-, -2/+2).
+    let off = |d: usize, k: usize| -> isize {
+        CDEF_DIRECTIONS[d][k][0] as isize * WS as isize + CDEF_DIRECTIONS[d][k][1] as isize
+    };
+    let d_lo = (dir + 6) & 7;
+    let d_hi = (dir + 2) & 7;
+    let pri_off = [off(dir, 0), off(dir, 1)];
+    let sec_off = [[off(d_lo, 0), off(d_hi, 0)], [off(d_lo, 1), off(d_hi, 1)]];
+    #[inline(always)]
+    fn constrain_adj(diff: i32, threshold: i32, adj: i32) -> i32 {
+        let mag = diff.abs().min((threshold - (diff.abs() >> adj)).max(0));
+        if diff < 0 { -mag } else { mag }
+    }
+    for i in 0..h {
         for j in 0..w {
+            let ci = ((i + B) * WS + j + B) as isize;
+            let x = win[ci as usize];
             let mut sum = 0i32;
-            let x = src.get(x0 + j, y0 + i) as i32;
             let mut max = x;
             let mut min = x;
             for k in 0..2 {
-                for sign in [-1i32, 1] {
-                    if let Some(p) = get(i, j, dir, k, sign) {
-                        sum += pri_taps[k] * constrain(p - x, pri_str, damping);
+                for sign in [-1isize, 1] {
+                    let p = win[(ci + sign * pri_off[k]) as usize];
+                    if p != CDEF_NA {
+                        if pri_str != 0 {
+                            sum += pri_taps[k] * constrain_adj(p - x, pri_str, pri_adj);
+                        }
                         max = max.max(p);
                         min = min.min(p);
                     }
-                    for dir_off in [-2i32, 2] {
-                        let d2 = ((dir as i32 + dir_off) & 7) as usize;
-                        if let Some(s) = get(i, j, d2, k, sign) {
-                            sum += sec_taps[k] * constrain(s - x, sec_str, damping);
+                    for so in sec_off[k] {
+                        let s = win[(ci + sign * so) as usize];
+                        if s != CDEF_NA {
+                            if sec_str != 0 {
+                                sum += sec_taps[k] * constrain_adj(s - x, sec_str, sec_adj);
+                            }
                             max = max.max(s);
                             min = min.min(s);
                         }
@@ -501,7 +570,7 @@ fn cdef_filter(
                 }
             }
             let v = x + ((8 + sum - (sum < 0) as i32) >> 4);
-            dst.set(x0 + j, y0 + i, clip3(min, max, v) as u16);
+            res[i * w + j] = v.clamp(min, max) as u16;
         }
     }
 }

@@ -1237,7 +1237,78 @@ pub(crate) fn block_inter_prediction(
             filt_y = 5;
         }
     }
-    let mut intermediate = vec![0i32; inter_h * w];
+    // The intermediate array: a per-thread buffer, reused.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < inter_h * w {
+            buf.resize(inter_h * w, 0);
+        }
+        block_inter_prediction_with(
+            refp,
+            last_x,
+            last_y,
+            x,
+            y,
+            x_step,
+            y_step,
+            w,
+            h,
+            [filt_y, filt_x],
+            inter_h,
+            rv,
+            pred,
+            &mut buf[..inter_h * w],
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_inter_prediction_with(
+    refp: &PlaneBuf,
+    last_x: i32,
+    last_y: i32,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    [filt_y, filt_x]: [usize; 2],
+    inter_h: usize,
+    rv: RoundingVars,
+    pred: &mut [i32],
+    intermediate: &mut [i32],
+) {
+    if x_step == 1 << SCALE_SUBPEL_BITS && y_step == 1 << SCALE_SUBPEL_BITS {
+        // Unscaled: one filter phase per direction for the whole block.
+        let fx = &SUBPEL_FILTERS[filt_x][((x >> 6) & SUBPEL_MASK as i64) as usize];
+        let fy = &SUBPEL_FILTERS[filt_y][(((y & 1023) >> 6) & SUBPEL_MASK as i64) as usize];
+        let x0 = (x >> 10) - 3;
+        let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
+        let mut padded = [0u16; 128 + 8];
+        for r in 0..inter_h {
+            let yy = clip3(0, last_y, ((y >> 10) + r as i64 - 3) as i32) as usize;
+            let row = refp.row(yy);
+            let src: &[u16] = if inside_x {
+                &row[x0 as usize..x0 as usize + w + 7]
+            } else {
+                for (c, v) in padded[..w + 7].iter_mut().enumerate() {
+                    *v = row[clip3(0, last_x, (x0 + c as i64) as i32) as usize];
+                }
+                &padded[..w + 7]
+            };
+            let out = &mut intermediate[r * w..(r + 1) * w];
+            filter_row(src, fx, rv.round0, out);
+        }
+        for r in 0..h {
+            let out = &mut pred[r * w..(r + 1) * w];
+            filter_col(intermediate, r, w, fy, rv.round1, out);
+        }
+        return;
+    }
     for r in 0..inter_h {
         let yy = clip3(0, last_y, ((y >> 10) + r as i64 - 3) as i32) as usize;
         let row = refp.row(yy);
@@ -1264,6 +1335,57 @@ pub(crate) fn block_inter_prediction(
             }
             pred[r * w + c] = round2(s, rv.round1);
         }
+    }
+}
+
+/// One row of the horizontal filter: `out[c] = Round2(sum f[t] *
+/// src[c + t], round0)` (`src` holds `out.len() + 7` samples).
+#[inline]
+fn filter_row(src: &[u16], f: &[i32; 8], round0: u32, out: &mut [i32]) {
+    let w = out.len();
+    let add = (1 << round0) >> 1;
+    if f[3] == 128 {
+        for c in 0..w {
+            out[c] = (128 * src[c + 3] as i32 + add) >> round0;
+        }
+        return;
+    }
+    let mut acc = [0i32; 128];
+    let acc = &mut acc[..w];
+    for t in 0..8 {
+        let ft = f[t];
+        let s = &src[t..t + w];
+        for c in 0..w {
+            acc[c] += ft * s[c] as i32;
+        }
+    }
+    for c in 0..w {
+        out[c] = (acc[c] + add) >> round0;
+    }
+}
+
+/// One output row of the vertical filter over the intermediate array.
+#[inline]
+fn filter_col(inter: &[i32], r: usize, w: usize, f: &[i32; 8], round1: u32, out: &mut [i32]) {
+    let add = (1 << round1) >> 1;
+    if f[3] == 128 {
+        let s = &inter[(r + 3) * w..(r + 4) * w];
+        for c in 0..w {
+            out[c] = (128 * s[c] + add) >> round1;
+        }
+        return;
+    }
+    let mut acc = [0i32; 128];
+    let acc = &mut acc[..w];
+    for t in 0..8 {
+        let ft = f[t];
+        let s = &inter[(r + t) * w..(r + t + 1) * w];
+        for c in 0..w {
+            acc[c] += ft * s[c];
+        }
+    }
+    for c in 0..w {
+        out[c] = (acc[c] + add) >> round1;
     }
 }
 
