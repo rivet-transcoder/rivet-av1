@@ -257,6 +257,57 @@ fn tiles() {
     round_trip(cfg, &frames);
 }
 
+/// Every tool of the default speed (loop restoration, CDEF, compound,
+/// chroma from luma) on a small natural crop, and palettes on a frame of
+/// few colours: decoded to the reconstruction. Cheap enough for the
+/// overflow-checked run.
+#[test]
+fn every_tool_round_trips() {
+    let src = natural(4);
+    let crop = |f: &Frame| {
+        let mut c = Frame::new(96, 64, 8, ChromaFormat::Yuv420);
+        for p in 0..3 {
+            let pl = c.planes[p];
+            for y in 0..pl.height {
+                for x in 0..pl.width {
+                    c.set_sample(p, x, y, f.sample(p, x + 40, y + 30));
+                }
+            }
+        }
+        c
+    };
+    let frames: Vec<Frame> = src.iter().map(crop).collect();
+    let mut cfg = Config::new(96, 64);
+    cfg.quantizer = 120;
+    round_trip(cfg, &frames);
+    // Screen content: text-like glyphs of two colours on a flat ground.
+    let screen: Vec<Frame> = (0..2u32)
+        .map(|t| {
+            let mut f = Frame::new(64, 64, 8, ChromaFormat::Yuv420);
+            for y in 0..64u32 {
+                for x in 0..64u32 {
+                    let glyph = ((x / 6 + y / 9 + t).wrapping_mul(2654435761u32) >> 29) & 1 == 1
+                        && x % 6 < 5
+                        && y % 9 < 7;
+                    f.set_sample(0, x, y, if glyph { 20 } else { 235 });
+                }
+            }
+            for p in 1..3 {
+                let pl = f.planes[p];
+                for y in 0..pl.height {
+                    for x in 0..pl.width {
+                        f.set_sample(p, x, y, 128);
+                    }
+                }
+            }
+            f
+        })
+        .collect();
+    let mut cfg = Config::new(64, 64);
+    cfg.quantizer = 80;
+    round_trip(cfg, &screen);
+}
+
 #[test]
 fn natural_video_quality_tracks_the_quantiser() {
     let src = natural(6);

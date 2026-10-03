@@ -907,10 +907,10 @@ pub(crate) fn box_filter_rect(
     let ru = r as usize;
     for i in 0..h + 2 {
         // Window row of position i - 1, box rows from it - r to it + r.
-        let wy = i - 1 + LRB;
+        let wy = i + LRB - 1;
         let (ya, yb) = (wy - ru, wy + ru + 1);
         for j in 0..w + 2 {
-            let wx = j - 1 + LRB;
+            let wx = j + LRB - 1;
             let (xa, xb) = (wx - ru, wx + ru + 1);
             let boxed =
                 |t: &[i64]| t[yb * iw + xb] - t[ya * iw + xb] - t[yb * iw + xa] + t[ya * iw + xa];
