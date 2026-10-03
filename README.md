@@ -1,6 +1,6 @@
 # rivet-av1
 
-[![CI](https://github.com/rivet-transcoder/rivet-av1/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet-av1/actions/workflows/ci.yml)
+[![CI](https://github.com/safewords/rivet-av1/actions/workflows/ci.yml/badge.svg)](https://github.com/safewords/rivet-av1/actions/workflows/ci.yml)
 
 An **AV1** decoder and encoder in Rust: no C, no system libraries, no build
 script, nothing to install on a build host. Written from the *AV1
@@ -11,7 +11,7 @@ conformance streams (the numbers are
 [below](#how-it-is-checked)); the encoder writes key and inter frames that
 decode to exactly what it reconstructed.
 
-Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
+Written for the **[rivet](https://github.com/safewords/rivet)**
 transcoder, whose default output codec is AV1 (today through the
 third-party rav1d and rav1e crates). Usable on its own by anything that has
 AV1 temporal units (from IVF, WebM / Matroska, MP4, or an Annex B stream)
@@ -26,7 +26,7 @@ dependency (`thiserror`), no features, no build script.
 
 ```toml
 [dependencies]
-av1 = { package = "rivet-av1", git = "https://github.com/rivet-transcoder/rivet-av1", branch = "develop" }
+av1 = { package = "rivet-av1", git = "https://github.com/safewords/rivet-av1", branch = "develop" }
 ```
 
 ## What it decodes
