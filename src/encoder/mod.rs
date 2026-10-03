@@ -14,6 +14,7 @@
 //! a first pass's reconstruction, and the frame is then coded again
 //! replaying the first pass's decisions with them.
 
+mod aq;
 pub(crate) mod cdef;
 pub(crate) mod fwd;
 pub(crate) mod lr;
@@ -171,6 +172,9 @@ pub struct Tools {
     /// threads, then the frame coded again with them. The output does not
     /// depend on the thread count.
     pub wavefront: bool,
+    /// Adaptive quantisation: superblocks the previous frame predicts well
+    /// coded finer, those it does not coarser (`delta_q_present`).
+    pub aq: bool,
 }
 
 impl Tools {
@@ -231,6 +235,7 @@ impl Tools {
             tx_depth_max: if s >= 6 { 1 } else { 2 },
             prune_intra: s >= 5,
             wavefront: s >= 5,
+            aq: false,
         }
     }
 
@@ -270,6 +275,7 @@ impl Tools {
             "tx_depth_max" => self.tx_depth_max = value.min(2) as u8,
             "prune_intra" => self.prune_intra = b,
             "wavefront" => self.wavefront = b,
+            "aq" => self.aq = b,
             _ => return false,
         }
         true
@@ -316,6 +322,8 @@ pub struct Encoder {
     q: f64,
     /// Average-bitrate rate control (`Config::target_bits_per_frame`).
     rc: Option<rc::RateControl>,
+    /// The previous frame's source planes (adaptive quantisation).
+    prev_src: Option<Arc<Vec<Vec<u16>>>>,
     recon: Option<Frame>,
     /// The frame number each reference slot holds.
     slot_frame: [u64; NUM_REF_FRAMES],
@@ -352,6 +360,8 @@ struct FrameParams {
     tx_select: bool,
     reduced_tx_set: bool,
     tile_cols_log2: u32,
+    /// Adaptive quantisation: each superblock's quantiser.
+    aq: Option<Arc<tile::AqMap>>,
 }
 
 /// What a second coding pass replays.
@@ -462,6 +472,7 @@ impl Encoder {
             last_key: false,
             q,
             rc,
+            prev_src: None,
             recon: None,
             slot_frame: [0; NUM_REF_FRAMES],
             last_slot: 0,
@@ -576,6 +587,7 @@ impl Encoder {
         } else if tools.multi_ref {
             std::mem::swap(&mut self.last_slot, &mut self.last2_slot);
         }
+        self.prev_src = Some(src.clone());
         self.frame_num += 1;
         self.since_key = if key { 1 } else { self.since_key + 1 };
         self.force_key = false;
@@ -601,6 +613,32 @@ impl Encoder {
         let tools = self.cfg.tools;
         let (src, stride) = (src.clone(), stride.to_vec());
         let mut p = self.frame_params(key, qidx);
+        if tools.aq
+            && let Some(prev) = self.prev_src.as_ref()
+        {
+            let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+            if let Some((sb_cols, q)) = aq::quantisers(
+                &src[0],
+                &prev[0],
+                stride[0],
+                w,
+                h,
+                self.cfg.bit_depth,
+                p.qidx,
+            ) {
+                let bdi = ((self.cfg.bit_depth - 8) >> 1) as usize;
+                let lambda = q
+                    .iter()
+                    .map(|&qi| {
+                        (
+                            0.4 * AC_QLOOKUP[bdi][qi as usize] as f64,
+                            rd_lambda(&self.cfg, qi as u32),
+                        )
+                    })
+                    .collect();
+                p.aq = Some(Arc::new(tile::AqMap { sb_cols, q, lambda }));
+            }
+        }
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
         if tools.lf_search || tools.cdef || tools.restoration || coded.tiles.is_empty() {
             // The in-loop filters' parameters, chosen on the first pass's
@@ -777,6 +815,7 @@ impl Encoder {
             tx_select: tools.tx_size && tools.rdo,
             reduced_tx_set: !(tools.full_tx_set && tools.rdo),
             tile_cols_log2: self.cfg.tile_cols_log2,
+            aq: None,
         }
     }
 
@@ -937,6 +976,7 @@ impl Encoder {
             lr_plan: None,
             palette_map: Box::new([[0; 64]; 64]),
             me_hints: Vec::new(),
+            aq: p.aq.clone(),
         })
     }
 
@@ -1018,7 +1058,13 @@ impl Encoder {
         w.flag(false); // DeltaQUAc
         w.flag(false); // using_qmatrix
         w.flag(false); // segmentation_enabled
-        w.flag(false); // delta_q_present
+        if p.qidx > 0 {
+            w.flag(p.aq.is_some()); // delta_q_present
+            if p.aq.is_some() {
+                w.f(2, 0); // delta_q_res
+                w.flag(false); // delta_lf_present
+            }
+        }
         // loop_filter_params()
         w.f(6, p.lf[0]);
         w.f(6, p.lf[1]);

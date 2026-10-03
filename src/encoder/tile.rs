@@ -56,6 +56,18 @@ pub(crate) struct EncCtx {
     /// reference (`(ref_frame - LAST_FRAME) * cells + cell`): starting
     /// points for the searches of the blocks around and above it.
     pub(crate) me_hints: Vec<Mv>,
+    /// Adaptive quantisation: each superblock's quantiser, coded as a
+    /// `delta_qindex` (the frame has `delta_q_present`).
+    pub(crate) aq: Option<std::sync::Arc<AqMap>>,
+}
+
+/// Each superblock's quantiser index and the Lagrange multipliers that go
+/// with it (`EncCtx::lambda`, `EncCtx::rd_lambda`), in raster order.
+#[derive(Debug)]
+pub(crate) struct AqMap {
+    pub(crate) sb_cols: usize,
+    pub(crate) q: Vec<u8>,
+    pub(crate) lambda: Vec<(f64, f64)>,
 }
 
 impl EncCtx {
@@ -253,6 +265,28 @@ impl TileDecoder<'_, '_> {
             TX_HEIGHT_LOG2[tx_sz],
             tx_sz,
         )
+    }
+
+    /// At the start of superblock `(r, c)`: its multipliers, under adaptive
+    /// quantisation.
+    pub(crate) fn enc_begin_sb(&mut self, r: usize, c: usize) {
+        let e = self.enc.as_mut().expect("encode mode");
+        if let Some(aq) = e.aq.as_ref() {
+            let i = (r >> 4) * aq.sb_cols + (c >> 4);
+            (e.lambda, e.rd_lambda) = aq.lambda[i];
+        }
+    }
+
+    /// The `delta_qindex` (in units of `delta_q_res`) that takes the
+    /// quantiser to this superblock's.
+    pub(crate) fn enc_delta_qindex(&self) -> i32 {
+        let Some(aq) = self.enc().aq.as_ref() else {
+            return 0;
+        };
+        let i = (self.b.mi_row >> 4) * aq.sb_cols + (self.b.mi_col >> 4);
+        let diff = aq.q[i] as i32 - self.current_q_index;
+        let res = self.f.hdr.delta_q_res;
+        (diff as f64 / (1 << res) as f64).round() as i32
     }
 
     /// SATD between the source and `CurrFrame` over a region.

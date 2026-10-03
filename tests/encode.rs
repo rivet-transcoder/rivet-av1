@@ -280,6 +280,15 @@ fn every_tool_round_trips() {
     let mut cfg = Config::new(96, 64);
     cfg.quantizer = 120;
     round_trip(cfg, &frames);
+    // The speed-6 search (wavefront rows on two threads, pruning) with
+    // adaptive quantisation (delta_qindex per superblock).
+    let mut cfg = Config::new(96, 64);
+    cfg.quantizer = 120;
+    cfg.speed = 6;
+    cfg.tools = av1::Tools::for_speed(6);
+    cfg.tools.aq = true;
+    cfg.threads = 2;
+    round_trip(cfg, &frames);
     // Screen content: text-like glyphs of two colours on a flat ground.
     let screen: Vec<Frame> = (0..2u32)
         .map(|t| {

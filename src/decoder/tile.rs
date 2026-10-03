@@ -310,6 +310,9 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             BLOCK_64X64
         };
         self.read_deltas = self.f.hdr.delta_q_present;
+        if self.sd.encoding() {
+            self.enc_begin_sb(r, c);
+        }
         self.clear_cdef(r, c);
         self.clear_block_decoded_flags(r, c, NUM_4X4_BLOCKS_WIDE[sb_size]);
         self.read_lr(r, c, sb_size);
@@ -1039,7 +1042,26 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         if self.b.mi_size == sb_size && self.b.skip {
             return;
         }
-        if self.read_deltas {
+        if self.read_deltas && self.sd.encoding() {
+            // The encoder's planned quantiser for this superblock.
+            let reduced = self.enc_delta_qindex();
+            let abs = reduced.unsigned_abs();
+            self.sd
+                .symbol(&mut self.cdf.delta_q, abs.min(DELTA_Q_SMALL) as usize);
+            if abs >= DELTA_Q_SMALL {
+                let rem_bits = 31 - (abs - 1).leading_zeros();
+                self.sd.literal(3, rem_bits - 1);
+                self.sd.literal(rem_bits, abs - 1 - (1 << rem_bits));
+            }
+            if abs != 0 {
+                self.sd.literal(1, (reduced < 0) as u32);
+                self.current_q_index = clip3(
+                    1,
+                    255,
+                    self.current_q_index + (reduced << self.f.hdr.delta_q_res),
+                );
+            }
+        } else if self.read_deltas {
             let mut delta_q_abs = self.sd.read_symbol(&mut self.cdf.delta_q) as i32;
             if delta_q_abs == DELTA_Q_SMALL as i32 {
                 let rem_bits = self.sd.read_literal(3) + 1;
