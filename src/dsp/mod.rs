@@ -4,6 +4,7 @@
 
 pub(crate) mod cdef;
 pub(crate) mod itx;
+pub(crate) mod lf;
 pub(crate) mod mc;
 
 /// Whether the CPU has AVX2 (checked once). `AV1_NO_SIMD` set in the

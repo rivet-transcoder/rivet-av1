@@ -839,22 +839,23 @@ impl Decoder {
         frame.render_height = data.render_height;
         frame.color = color_info(&seq.color);
         frame.hdr = self.hdr;
+        let grain_on = seq.film_grain_params_present && grain.apply_grain;
         let mut planes: Vec<Vec<u16>> = Vec::new();
-        for (p, pl) in data.frame.planes.iter().enumerate() {
-            let (sx, sy) = if p == 0 {
-                (0, 0)
-            } else {
-                (data.subsampling_x as usize, data.subsampling_y as usize)
-            };
-            let pw = (w + sx) >> sx;
-            let ph = (h + sy) >> sy;
-            let mut v = Vec::with_capacity(pw * ph);
-            for y in 0..ph {
-                v.extend_from_slice(&pl.row(y)[..pw]);
+        if grain_on {
+            for (p, pl) in data.frame.planes.iter().enumerate() {
+                let (sx, sy) = if p == 0 {
+                    (0, 0)
+                } else {
+                    (data.subsampling_x as usize, data.subsampling_y as usize)
+                };
+                let pw = (w + sx) >> sx;
+                let ph = (h + sy) >> sy;
+                let mut v = Vec::with_capacity(pw * ph);
+                for y in 0..ph {
+                    v.extend_from_slice(&pl.row(y)[..pw]);
+                }
+                planes.push(v);
             }
-            planes.push(v);
-        }
-        if seq.film_grain_params_present && grain.apply_grain {
             grain::apply(
                 seq,
                 data.bit_depth,
@@ -866,11 +867,26 @@ impl Decoder {
                 &mut planes,
             );
         }
-        for (p, v) in planes.iter().enumerate() {
+        let wide = data.bit_depth > 8;
+        for p in 0..frame.planes.len() {
             let pl = frame.planes[p];
-            for y in 0..pl.height {
-                for x in 0..pl.width {
-                    frame.set_sample(p, x, y, v[(y * pl.width + x) as usize]);
+            let (pw, ph) = (pl.width as usize, pl.height as usize);
+            let out = frame.plane_mut(p);
+            for y in 0..ph {
+                let src: &[u16] = if grain_on {
+                    &planes[p][y * pw..(y + 1) * pw]
+                } else {
+                    &data.frame.planes[p].row(y)[..pw]
+                };
+                if wide {
+                    let row = out[y * pw * 2..(y + 1) * pw * 2].as_chunks_mut::<2>().0;
+                    for (o, &v) in row.iter_mut().zip(src) {
+                        *o = v.to_le_bytes();
+                    }
+                } else {
+                    for (o, &v) in out[y * pw..(y + 1) * pw].iter_mut().zip(src) {
+                        *o = v as u8;
+                    }
                 }
             }
         }

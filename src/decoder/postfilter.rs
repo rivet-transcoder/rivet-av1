@@ -4,8 +4,8 @@
 
 use crate::bits::floor_log2;
 use crate::consts::*;
+use crate::decoder::FrameCtx;
 use crate::decoder::state::{FrameBuf, PlaneBuf};
-use crate::decoder::{FrameCtx, count_units_in_frame};
 use crate::tables::*;
 
 // ---------------------------------------------------------------------------
@@ -174,21 +174,35 @@ fn edge_loop_filter(
     if lvl == 0 {
         return;
     }
-    let bd = f.bit_depth;
-    for i in 0..MI_SIZE as i32 {
-        sample_filter(
-            p,
-            xp as i32 + dy * i,
-            yp as i32 + dx * i,
-            plane,
-            limit,
-            blimit,
-            thresh,
-            dx,
-            dy,
-            filter_size,
-            bd,
-        );
+    // The four samples along the edge, filtered together (7.14.6 for each).
+    let stride = p.stride as isize;
+    let step = dy as isize * stride + dx as isize;
+    let along = dx as isize * stride + dy as isize;
+    let base = yp as isize * stride + xp as isize;
+    let reach: isize = if filter_size >= 16 { 7 } else { 4 };
+    let mut v: crate::dsp::lf::Edge = [[0; 4]; 14];
+    for l in 0..4isize {
+        for k in -reach..reach {
+            v[(7 + k) as usize][l as usize] = p.get((base + l * along + k * step) as usize) as i32;
+        }
+    }
+    let params = crate::dsp::lf::Params {
+        limit,
+        blimit,
+        thresh,
+        filter_size,
+        chroma: plane != 0,
+        bit_depth: f.bit_depth,
+    };
+    crate::dsp::lf::filter(&mut v, &params);
+    let span: isize = if filter_size >= 16 { 6 } else { 3 };
+    for l in 0..4isize {
+        for k in -span..span {
+            p.set(
+                (base + l * along + k * step) as usize,
+                v[(7 + k) as usize][l as usize] as u16,
+            );
+        }
     }
 }
 
@@ -251,137 +265,6 @@ fn filter_strength(
     let blimit = 2 * (lvl + 2) + limit;
     let thresh = lvl >> 4;
     (lvl, limit, blimit, thresh)
-}
-
-/// The sample filtering process (7.14.6).
-#[allow(clippy::too_many_arguments)]
-fn sample_filter(
-    p: SharedPlane,
-    x: i32,
-    y: i32,
-    plane: usize,
-    limit: i32,
-    blimit: i32,
-    thresh: i32,
-    dx: i32,
-    dy: i32,
-    filter_size: usize,
-    bd: u32,
-) {
-    let stride = p.stride as isize;
-    let base = y as isize * stride + x as isize;
-    let step = dy as isize * stride + dx as isize;
-    // The samples across the edge: v[7 + k] is the k-th from it (q0 at 7,
-    // p0 at 6).
-    let reach: isize = if filter_size >= 16 { 7 } else { 4 };
-    let mut v = [0i32; 14];
-    for k in -reach..reach {
-        v[(7 + k) as usize] = p.get((base + k * step) as usize) as i32;
-    }
-    let (q0, q1, q2, q3) = (v[7], v[8], v[9], v[10]);
-    let (p0, p1, p2, p3) = (v[6], v[5], v[4], v[3]);
-    // The filter mask process (7.14.6.2).
-    let sh = bd - 8;
-    let thresh_bd = thresh << sh;
-    let hev_mask = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
-    let filter_len = if filter_size == 4 {
-        4
-    } else if plane != 0 {
-        6
-    } else if filter_size == 8 {
-        8
-    } else {
-        16
-    };
-    let limit_bd = limit << sh;
-    let blimit_bd = blimit << sh;
-    let mut mask = (p1 - p0).abs() > limit_bd
-        || (q1 - q0).abs() > limit_bd
-        || (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit_bd;
-    if filter_len >= 6 {
-        mask |= (p2 - p1).abs() > limit_bd || (q2 - q1).abs() > limit_bd;
-    }
-    if filter_len >= 8 {
-        mask |= (p3 - p2).abs() > limit_bd || (q3 - q2).abs() > limit_bd;
-    }
-    if mask {
-        return;
-    }
-    let threshold_bd = 1 << sh;
-    let mut flat_mask = false;
-    if filter_size >= 8 {
-        let mut m = (p1 - p0).abs() > threshold_bd
-            || (q1 - q0).abs() > threshold_bd
-            || (p2 - p0).abs() > threshold_bd
-            || (q2 - q0).abs() > threshold_bd;
-        if filter_len >= 8 {
-            m |= (p3 - p0).abs() > threshold_bd || (q3 - q0).abs() > threshold_bd;
-        }
-        flat_mask = !m;
-    }
-    let mut flat_mask2 = false;
-    if filter_size >= 16 {
-        let (q4, q5, q6) = (v[11], v[12], v[13]);
-        let (p4, p5, p6) = (v[2], v[1], v[0]);
-        let m = (p6 - p0).abs() > threshold_bd
-            || (q6 - q0).abs() > threshold_bd
-            || (p5 - p0).abs() > threshold_bd
-            || (q5 - q0).abs() > threshold_bd
-            || (p4 - p0).abs() > threshold_bd
-            || (q4 - q0).abs() > threshold_bd;
-        flat_mask2 = !m;
-    }
-    let set = |k: isize, val: i32| p.set((base + k * step) as usize, val as u16);
-    if filter_size == 4 || !flat_mask {
-        // The narrow filter process (7.14.6.3).
-        let lo = -(1 << (bd - 1));
-        let hi = (1 << (bd - 1)) - 1;
-        let c = |v: i32| v.clamp(lo, hi);
-        let off = 0x80 << sh;
-        let ps1 = p1 - off;
-        let ps0 = p0 - off;
-        let qs0 = q0 - off;
-        let qs1 = q1 - off;
-        let mut filter = if hev_mask { c(ps1 - qs1) } else { 0 };
-        filter = c(filter + 3 * (qs0 - ps0));
-        let filter1 = c(filter + 4) >> 3;
-        let filter2 = c(filter + 3) >> 3;
-        set(0, c(qs0 - filter1) + off);
-        set(-1, c(ps0 + filter2) + off);
-        if !hev_mask {
-            let filter = round2(filter1, 1);
-            set(1, c(qs1 - filter) + off);
-            set(-2, c(ps1 + filter) + off);
-        }
-    } else {
-        // The wide filter process (7.14.6.4).
-        let log2_size = if filter_size == 8 || !flat_mask2 {
-            3
-        } else {
-            4
-        };
-        let n: isize = if log2_size == 4 {
-            6
-        } else if plane == 0 {
-            3
-        } else {
-            2
-        };
-        let n2: isize = if log2_size == 3 && plane == 0 { 0 } else { 1 };
-        let mut fv = [0i32; 12];
-        for i in -n..n {
-            let mut t = 0;
-            for j in -n..=n {
-                let pp = (i + j).clamp(-(n + 1), n);
-                let tap = if j.abs() <= n2 { 2 } else { 1 };
-                t += v[(7 + pp) as usize] * tap;
-            }
-            fv[(i + n) as usize] = round2(t, log2_size);
-        }
-        for i in -n..n {
-            set(i, fv[(i + n) as usize]);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,13 +573,13 @@ pub(crate) fn upscale(f: &FrameCtx, input: &FrameBuf) -> Option<FrameBuf> {
 // Loop restoration (7.17)
 // ---------------------------------------------------------------------------
 
-struct LrCtx<'a> {
-    cur: &'a PlaneBuf,
-    cdef: &'a PlaneBuf,
-    stripe_start_y: i32,
-    stripe_end_y: i32,
-    plane_end_x: i32,
-    plane_end_y: i32,
+pub(crate) struct LrCtx<'a> {
+    pub(crate) cur: &'a PlaneBuf,
+    pub(crate) cdef: &'a PlaneBuf,
+    pub(crate) stripe_start_y: i32,
+    pub(crate) stripe_end_y: i32,
+    pub(crate) plane_end_x: i32,
+    pub(crate) plane_end_y: i32,
 }
 
 impl LrCtx<'_> {
@@ -719,8 +602,13 @@ impl LrCtx<'_> {
 
 /// The loop restoration process (7.17): `LrFrame` from `UpscaledCurrFrame`
 /// and `UpscaledCdefFrame` (taken: it is the starting point of `LrFrame`),
-/// on up to `threads` threads (bands of 64 luma rows: each block writes
-/// only its own samples).
+/// on up to `threads` threads.
+///
+/// The specification filters 4x4 blocks, each with the parameters of its
+/// stripe (64 luma rows, offset by 8) and unit; here each stripe of each
+/// unit is filtered as one rectangle, from a window of the samples the
+/// process reads (`LrCtx::sample`): the same arithmetic, sample for sample.
+/// Stripes write only their own rows, so they run in parallel.
 pub(crate) fn loop_restoration(
     f: &FrameCtx,
     cur: &FrameBuf,
@@ -732,173 +620,302 @@ pub(crate) fn loop_restoration(
     }
     let mut lr = cdef.clone();
     let planes: Vec<SharedPlane> = lr.planes.iter_mut().map(SharedPlane::new).collect();
-    let height = f.hdr.frame_height as usize;
-    let band = |b: usize| {
-        let mut y = b * 64;
-        while y < ((b + 1) * 64).min(height) {
-            let mut x = 0;
-            while x < f.hdr.upscaled_width as usize {
-                for plane in 0..f.num_planes {
-                    if f.hdr.frame_restoration_type[plane] != RESTORE_NONE {
-                        loop_restore_block(
-                            f,
-                            cur,
-                            &cdef,
-                            planes[plane],
-                            plane,
-                            y >> MI_SIZE_LOG2,
-                            x >> MI_SIZE_LOG2,
-                        );
-                    }
-                }
-                x += MI_SIZE;
-            }
-            y += MI_SIZE;
+    let stripes = (f.hdr.frame_height as usize + 8).div_ceil(64);
+    let mut jobs = Vec::new();
+    for plane in 0..f.num_planes {
+        if f.hdr.frame_restoration_type[plane] != RESTORE_NONE {
+            jobs.extend((0..stripes).map(|s| (plane, s)));
         }
+    }
+    let job = |i: usize| {
+        let (plane, s) = jobs[i];
+        restore_stripe(f, cur, &cdef, planes[plane], plane, s);
     };
-    let bands = height.div_ceil(64);
     if threads > 1 {
-        crate::decoder::parallel_map(bands, threads, band);
+        crate::decoder::parallel_map(jobs.len(), threads, job);
     } else {
-        (0..bands).for_each(band);
+        (0..jobs.len()).for_each(job);
     }
     lr
 }
 
-/// The loop restore block process (7.17.1).
-fn loop_restore_block(
+/// The geometry of a stripe of a plane: `(stripe_start_y, stripe_end_y,
+/// first row, last row, unit row)`, or `None` past the plane.
+pub(crate) fn lr_stripe(
+    f: &FrameCtx,
+    plane: usize,
+    s: usize,
+) -> Option<(i32, i32, i32, i32, usize)> {
+    let (sub_x, sub_y) = f.plane_ss(plane);
+    let _ = sub_x;
+    let plane_end_y = round2(f.hdr.frame_height as i32, sub_y as u32) - 1;
+    let stripe_start_y = (-8 + s as i32 * 64) >> sub_y;
+    let stripe_end_y = stripe_start_y + (64 >> sub_y) - 1;
+    let y0 = stripe_start_y.max(0);
+    let y1 = stripe_end_y.min(plane_end_y);
+    if y0 > y1 {
+        return None;
+    }
+    let unit_size = f.hdr.loop_restoration_size[plane];
+    let unit_rows = f.lr[plane].unit_rows;
+    // The unit row of the stripe's first 4x4 block row (7.17.1).
+    let luma_row = (s * 64).saturating_sub(8);
+    let unit_row = (unit_rows - 1).min(((luma_row + 8) >> sub_y) / unit_size);
+    Some((stripe_start_y, stripe_end_y, y0, y1, unit_row))
+}
+
+/// The columns `x0..=x1` of unit column `uc` of a plane.
+pub(crate) fn lr_unit_cols(f: &FrameCtx, plane: usize, uc: usize) -> (i32, i32) {
+    let (sub_x, _) = f.plane_ss(plane);
+    let plane_end_x = round2(f.hdr.upscaled_width as i32, sub_x as u32) - 1;
+    let unit_size = f.hdr.loop_restoration_size[plane] as i32;
+    let x0 = uc as i32 * unit_size;
+    let x1 = if uc + 1 == f.lr[plane].unit_cols {
+        plane_end_x
+    } else {
+        ((uc as i32 + 1) * unit_size - 1).min(plane_end_x)
+    };
+    (x0, x1)
+}
+
+fn restore_stripe(
     f: &FrameCtx,
     cur: &FrameBuf,
     cdef: &FrameBuf,
     out: SharedPlane,
     plane: usize,
-    row: usize,
-    col: usize,
+    s: usize,
 ) {
-    let luma_y = row * MI_SIZE;
-    let stripe_num = (luma_y + 8) / 64;
-    let (sub_x, sub_y) = f.plane_ss(plane);
-    let stripe_start_y = (-8 + stripe_num as i32 * 64) >> sub_y;
-    let stripe_end_y = stripe_start_y + (64 >> sub_y) - 1;
-    let unit_size = f.hdr.loop_restoration_size[plane];
-    let unit_rows = count_units_in_frame(
-        unit_size,
-        round2(f.hdr.frame_height as i32, sub_y as u32) as usize,
-    );
-    let unit_cols = count_units_in_frame(
-        unit_size,
-        round2(f.hdr.upscaled_width as i32, sub_x as u32) as usize,
-    );
-    let unit_row = (unit_rows - 1).min(((row * MI_SIZE + 8) >> sub_y) / unit_size);
-    let unit_col = (unit_cols - 1).min(((col * MI_SIZE) >> sub_x) / unit_size);
-    let plane_end_x = round2(f.hdr.upscaled_width as i32, sub_x as u32) - 1;
-    let plane_end_y = round2(f.hdr.frame_height as i32, sub_y as u32) - 1;
-    let x = ((col * MI_SIZE) >> sub_x) as i32;
-    let y = ((row * MI_SIZE) >> sub_y) as i32;
-    if x > plane_end_x || y > plane_end_y {
+    let Some((stripe_start_y, stripe_end_y, y0, y1, unit_row)) = lr_stripe(f, plane, s) else {
         return;
-    }
-    let w = ((MI_SIZE >> sub_x) as i32).min(plane_end_x - x + 1);
-    let h = ((MI_SIZE >> sub_y) as i32).min(plane_end_y - y + 1);
-    let lp = &f.lr[plane];
-    let uidx = unit_row * lp.unit_cols + unit_col;
-    let r_type = lp.lr_type[uidx];
+    };
+    let (sub_x, sub_y) = f.plane_ss(plane);
     let ctx = LrCtx {
         cur: &cur.planes[plane],
         cdef: &cdef.planes[plane],
         stripe_start_y,
         stripe_end_y,
-        plane_end_x,
-        plane_end_y,
+        plane_end_x: round2(f.hdr.upscaled_width as i32, sub_x as u32) - 1,
+        plane_end_y: round2(f.hdr.frame_height as i32, sub_y as u32) - 1,
     };
+    let lp = &f.lr[plane];
+    let mut buf = LrBuffers::default();
+    for uc in 0..lp.unit_cols {
+        let (x0, x1) = lr_unit_cols(f, plane, uc);
+        if x0 > ctx.plane_end_x {
+            continue;
+        }
+        let uidx = unit_row * lp.unit_cols + uc;
+        let params = match lp.lr_type[uidx] {
+            RESTORE_WIENER => LrParams::Wiener(lp.wiener[uidx]),
+            RESTORE_SGRPROJ => LrParams::Sgr(lp.sgr_set[uidx] as usize, lp.sgr_xqd[uidx]),
+            _ => continue,
+        };
+        let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+        restore_rect(f, &ctx, x0, y0, w, h, &params, &mut buf);
+        for i in 0..h {
+            out.write_row(x0 as usize, y0 as usize + i, &buf.out[i * w..(i + 1) * w]);
+        }
+    }
+}
+
+/// One unit's restoration parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LrParams {
+    /// `LrWiener[ unit ]`: the vertical then horizontal coefficients.
+    Wiener([[i32; 3]; 2]),
+    /// `LrSgrSet` and `LrSgrXqd`.
+    Sgr(usize, [i32; 2]),
+}
+
+/// Scratch for [`restore_rect`]; `out` holds the result.
+#[derive(Default)]
+pub(crate) struct LrBuffers {
+    pub(crate) win: Vec<i32>,
+    inter: Vec<i32>,
+    pub(crate) flt: [Vec<i32>; 2],
+    a: Vec<i32>,
+    b: Vec<i32>,
+    sq: Vec<i64>,
+    sum: Vec<i64>,
+    pub(crate) out: Vec<u16>,
+}
+
+/// The border of the sample window: the Wiener taps reach 3 samples, the
+/// self-guided boxes 2 plus 1 for the neighbourhood of `A` and `B`.
+pub(crate) const LRB: usize = 3;
+
+/// Restores the `w` x `h` rectangle at `(x0, y0)` (inside one stripe and
+/// one unit) with `params` into `buf.out` (row stride `w`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_rect(
+    f: &FrameCtx,
+    ctx: &LrCtx,
+    x0: i32,
+    y0: i32,
+    w: usize,
+    h: usize,
+    params: &LrParams,
+    buf: &mut LrBuffers,
+) {
+    lr_window(ctx, x0, y0, w, h, buf);
+    restore_rect_from_window(f, ctx, x0, y0, w, h, params, buf);
+}
+
+/// The samples a `w` x `h` rectangle at `(x0, y0)` reads, with a border of
+/// `LRB`, into `buf.win` (row stride `w + 2 * LRB`).
+pub(crate) fn lr_window(ctx: &LrCtx, x0: i32, y0: i32, w: usize, h: usize, buf: &mut LrBuffers) {
+    let ww = w + 2 * LRB;
+    let wh = h + 2 * LRB;
+    buf.win.resize(ww * wh, 0);
+    for r in 0..wh {
+        let y = y0 + r as i32 - LRB as i32;
+        let row = &mut buf.win[r * ww..(r + 1) * ww];
+        for (c, v) in row.iter_mut().enumerate() {
+            *v = ctx.sample(x0 + c as i32 - LRB as i32, y);
+        }
+    }
+}
+
+/// [`restore_rect`] once [`lr_window`] has filled the window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_rect_from_window(
+    f: &FrameCtx,
+    ctx: &LrCtx,
+    x0: i32,
+    y0: i32,
+    w: usize,
+    h: usize,
+    params: &LrParams,
+    buf: &mut LrBuffers,
+) {
+    let ww = w + 2 * LRB;
     let maxv = (1i32 << f.bit_depth) - 1;
-    let put = |x: usize, y: usize, v: u16| out.set(y * out.stride + x, v);
-    if r_type == RESTORE_WIENER {
-        let rv = f.rounding_variables(false);
-        let vfilter = wiener_coefficient(&lp.wiener[uidx][0]);
-        let hfilter = wiener_coefficient(&lp.wiener[uidx][1]);
-        let bd = f.bit_depth as i32;
-        let offset = 1i32 << (bd + FILTER_BITS - rv.round0 as i32 - 1);
-        let limit = (1i32 << (bd + 1 + FILTER_BITS - rv.round0 as i32)) - 1;
-        let mut inter = [[0i32; 4]; 10];
-        for r in 0..(h + 6) as usize {
-            for c in 0..w as usize {
-                let mut s = 0;
-                for t in 0..7 {
-                    s += hfilter[t] * ctx.sample(x + c as i32 + t as i32 - 3, y + r as i32 - 3);
+    buf.out.resize(w * h, 0);
+    match *params {
+        LrParams::Wiener(coef) => {
+            let rv = f.rounding_variables(false);
+            let vfilter = wiener_coefficient(&coef[0]);
+            let hfilter = wiener_coefficient(&coef[1]);
+            let bd = f.bit_depth as i32;
+            let offset = 1i32 << (bd + FILTER_BITS - rv.round0 as i32 - 1);
+            let limit = (1i32 << (bd + 1 + FILTER_BITS - rv.round0 as i32)) - 1;
+            buf.inter.resize((h + 6) * w, 0);
+            for r in 0..h + 6 {
+                let src = &buf.win[r * ww..(r + 1) * ww];
+                for c in 0..w {
+                    let mut s = 0;
+                    for t in 0..7 {
+                        s += hfilter[t] * src[c + t];
+                    }
+                    buf.inter[r * w + c] = clip3(-offset, limit - offset, round2(s, rv.round0));
                 }
-                let v = round2(s, rv.round0);
-                inter[r][c] = clip3(-offset, limit - offset, v);
+            }
+            for r in 0..h {
+                for c in 0..w {
+                    let mut s = 0;
+                    for t in 0..7 {
+                        s += vfilter[t] * buf.inter[(r + t) * w + c];
+                    }
+                    buf.out[r * w + c] = round2(s, rv.round1).clamp(0, maxv) as u16;
+                }
             }
         }
-        for r in 0..h as usize {
-            for c in 0..w as usize {
-                let mut s = 0;
-                for t in 0..7 {
-                    s += vfilter[t] * inter[r + t][c];
-                }
-                let v = round2(s, rv.round1);
-                put(x as usize + c, y as usize + r, v.clamp(0, maxv) as u16);
+        LrParams::Sgr(set, xqd) => {
+            for pass in 0..2 {
+                box_filter_rect(f, ctx, x0, y0, w, h, set, pass, buf);
             }
-        }
-    } else if r_type == RESTORE_SGRPROJ {
-        let set = lp.sgr_set[uidx] as usize;
-        let flt0 = box_filter(f, &ctx, x, y, w, h, set, 0);
-        let flt1 = box_filter(f, &ctx, x, y, w, h, set, 1);
-        let w0 = lp.sgr_xqd[uidx][0];
-        let w1 = lp.sgr_xqd[uidx][1];
-        let w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1;
-        let r0 = SGR_PARAMS[set][0];
-        let r1 = SGR_PARAMS[set][2];
-        for i in 0..h as usize {
-            for j in 0..w as usize {
-                let u = (ctx.cdef.get(x as usize + j, y as usize + i) as i32) << SGRPROJ_RST_BITS;
-                let mut v = w1 * u;
-                v += if r0 != 0 { w0 * flt0[i][j] } else { w0 * u };
-                v += if r1 != 0 { w2 * flt1[i][j] } else { w2 * u };
-                let s = round2(v, (SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS) as u32);
-                put(x as usize + j, y as usize + i, s.clamp(0, maxv) as u16);
+            let w0 = xqd[0];
+            let w1 = xqd[1];
+            let w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1;
+            let r0 = SGR_PARAMS[set][0];
+            let r1 = SGR_PARAMS[set][2];
+            for i in 0..h {
+                for j in 0..w {
+                    let u =
+                        (ctx.cdef.get(x0 as usize + j, y0 as usize + i) as i32) << SGRPROJ_RST_BITS;
+                    let mut v = w1 * u;
+                    v += if r0 != 0 {
+                        w0 * buf.flt[0][i * w + j]
+                    } else {
+                        w0 * u
+                    };
+                    v += if r1 != 0 {
+                        w2 * buf.flt[1][i * w + j]
+                    } else {
+                        w2 * u
+                    };
+                    let s = round2(v, (SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS) as u32);
+                    buf.out[i * w + j] = s.clamp(0, maxv) as u16;
+                }
             }
         }
     }
 }
 
-/// The box filter process (7.17.3).
+/// The box filter process (7.17.3) over a rectangle, from the window in
+/// `buf.win`, into `buf.flt[pass]` (row stride `w`). Box sums come from
+/// integral images of the window.
 #[allow(clippy::too_many_arguments)]
-fn box_filter(
+pub(crate) fn box_filter_rect(
     f: &FrameCtx,
     ctx: &LrCtx,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    x0: i32,
+    y0: i32,
+    w: usize,
+    h: usize,
     set: usize,
     pass: usize,
-) -> [[i32; 4]; 4] {
-    let mut out = [[0i32; 4]; 4];
+    buf: &mut LrBuffers,
+) {
     let r = SGR_PARAMS[set][pass * 2];
+    buf.flt[pass].resize(w * h, 0);
     if r == 0 {
-        return out;
+        return;
+    }
+    let ww = w + 2 * LRB;
+    let wh = h + 2 * LRB;
+    // Integral images (one row and column of zeros first).
+    let iw = ww + 1;
+    buf.sq.resize(iw * (wh + 1), 0);
+    buf.sum.resize(iw * (wh + 1), 0);
+    buf.sq[..iw].fill(0);
+    buf.sum[..iw].fill(0);
+    for y in 0..wh {
+        let mut rs = 0i64;
+        let mut rq = 0i64;
+        buf.sq[(y + 1) * iw] = 0;
+        buf.sum[(y + 1) * iw] = 0;
+        for x in 0..ww {
+            let c = buf.win[y * ww + x] as i64;
+            rs += c;
+            rq += c * c;
+            buf.sum[(y + 1) * iw + x + 1] = buf.sum[y * iw + x + 1] + rs;
+            buf.sq[(y + 1) * iw + x + 1] = buf.sq[y * iw + x + 1] + rq;
+        }
     }
     let eps = SGR_PARAMS[set][pass * 2 + 1];
     let bd = f.bit_depth;
     let n = (2 * r + 1) * (2 * r + 1);
     let n2e = n * n * eps;
     let s = ((1 << SGRPROJ_MTABLE_BITS) + n2e / 2) / n2e;
-    let mut a_arr = [[0i32; 6]; 6];
-    let mut b_arr = [[0i32; 6]; 6];
     let one_over_n = ((1 << SGRPROJ_RECIP_BITS) + n / 2) / n;
-    for i in -1..h + 1 {
-        for j in -1..w + 1 {
-            let mut a: i64 = 0;
-            let mut b: i32 = 0;
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let c = ctx.sample(x + j + dx, y + i + dy);
-                    a += (c * c) as i64;
-                    b += c;
-                }
-            }
+    // A and B at rectangle positions -1..h+1 by -1..w+1.
+    let aw = w + 2;
+    buf.a.resize(aw * (h + 2), 0);
+    buf.b.resize(aw * (h + 2), 0);
+    let ru = r as usize;
+    for i in 0..h + 2 {
+        // Window row of position i - 1, box rows from it - r to it + r.
+        let wy = i - 1 + LRB;
+        let (ya, yb) = (wy - ru, wy + ru + 1);
+        for j in 0..w + 2 {
+            let wx = j - 1 + LRB;
+            let (xa, xb) = (wx - ru, wx + ru + 1);
+            let boxed =
+                |t: &[i64]| t[yb * iw + xb] - t[ya * iw + xb] - t[yb * iw + xa] + t[ya * iw + xa];
+            let a = boxed(&buf.sq);
+            let b = boxed(&buf.sum) as i32;
             let a = round2_64(a, 2 * (bd - 8));
             let d = round2(b, bd - 8) as i64;
             let p = (a * n as i64 - d * d).max(0);
@@ -911,20 +928,22 @@ fn box_filter(
                 (((z << SGRPROJ_SGR_BITS) + z / 2) / (z + 1)) as i32
             };
             let b2 = ((1 << SGRPROJ_SGR_BITS) - a2) as i64 * b as i64 * one_over_n as i64;
-            a_arr[(i + 1) as usize][(j + 1) as usize] = a2;
-            b_arr[(i + 1) as usize][(j + 1) as usize] =
-                round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;
+            buf.a[i * aw + j] = a2;
+            buf.b[i * aw + j] = round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;
         }
     }
     for i in 0..h {
-        let shift = if pass == 0 && (i & 1) != 0 { 4 } else { 5 };
+        // Row parity of the frame (rectangles start on even rows, as the
+        // 4x4 blocks of the process do).
+        let yabs = y0 + i as i32;
+        let shift = if pass == 0 && (yabs & 1) != 0 { 4 } else { 5 };
         for j in 0..w {
             let mut a = 0i32;
             let mut b = 0i32;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
                     let weight = if pass == 0 {
-                        if ((i + dy) & 1) != 0 {
+                        if ((yabs + dy) & 1) != 0 {
                             if dx == 0 { 6 } else { 5 }
                         } else {
                             0
@@ -934,16 +953,16 @@ fn box_filter(
                     } else {
                         3
                     };
-                    a += weight * a_arr[(i + dy + 1) as usize][(j + dx + 1) as usize];
-                    b += weight * b_arr[(i + dy + 1) as usize][(j + dx + 1) as usize];
+                    let k = (i as i32 + 1 + dy) as usize * aw + (j as i32 + 1 + dx) as usize;
+                    a += weight * buf.a[k];
+                    b += weight * buf.b[k];
                 }
             }
-            let v = a * ctx.cdef.get((x + j) as usize, (y + i) as usize) as i32 + b;
-            out[i as usize][j as usize] =
+            let v = a * ctx.cdef.get(x0 as usize + j, y0 as usize + i) as i32 + b;
+            buf.flt[pass][i * w + j] =
                 round2(v, (SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS) as u32);
         }
     }
-    out
 }
 
 /// The Wiener coefficient process (7.17.5).
