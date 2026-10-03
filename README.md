@@ -6,8 +6,8 @@ An **AV1** decoder and encoder in Rust: no C, no system libraries, no build
 script, nothing to install on a build host. Written from the *AV1
 Bitstream & Decoding Process Specification* (AOMedia), not translated from
 any other implementation. The decoder is bit-exact on **all 244** of
-AOMedia's public AV1 test vectors and on ARGON_SUMMARY of the Argon
-conformance streams it was run on (the numbers are
+AOMedia's public AV1 test vectors and on all 3 015 of the Argon
+conformance streams (the numbers are
 [below](#how-it-is-checked)); the encoder writes key and inter frames that
 decode to exactly what it reconstructed.
 
@@ -171,7 +171,22 @@ At quantiser 90 the same eight frames take 161 503 bytes coded all-intra.
   with reference MD5s of all output). `tests/argon.rs` runs them from a
   local copy (`ARGON_DIR`; 7 GB, not downloaded by the tests), taking each
   stream's options (format, operating point, all layers) from its
-  reference command. ARGON_TABLE
+  reference command. **All 3 015
+  base streams pass**, every output byte matching:
+
+  | group | what it exercises | pass |
+  |---|---|---|
+  | profile0_core, profile1_core, profile2_core | the coverage streams, Annex B, per profile (0: 8/10-bit 4:2:0 and monochrome; 1: 4:4:4; 2: 4:2:2, 12-bit) | 764 / 764, 731 / 731, 894 / 894 |
+  | profileN_core_special, profileN_not_annexb_special | the suite's "special" streams, Annex B and section 5 | 330 / 330 |
+  | profileN_not_annexb | section 5 low-overhead streams | 37 / 37 |
+  | profileN_stress | the suite's stress streams | 252 / 252 |
+  | profile_switching | the suite's profile-switching streams | 7 / 7 |
+
+  The suite also carries, per stream, reference output for each operating
+  point (`layers/N`, about 75 000 more decodes of the same streams with
+  layers dropped); LAYERS_RESULT The large-scale-tile directories (tile
+  list OBUs, unsupported) and the error-resilience directories (no
+  reference output) are not run.
 - **The encoder** (`tests/encode.rs`): every temporal unit, decoded by a
   fresh decoder with the padding check on, equals the encoder's
   reconstruction exactly — key frames at several quantisers, inter frames,
