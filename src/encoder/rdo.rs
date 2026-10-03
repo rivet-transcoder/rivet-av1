@@ -52,6 +52,25 @@ pub(crate) struct Rdo {
     pub(crate) nonzero: u32,
     /// Snapshots for reuse.
     pool: Vec<Snap>,
+    /// The partition candidates on trial, innermost last: the cost of what
+    /// each has coded so far against the best candidate before it.
+    trials: Vec<Trial>,
+    /// The trial (index in `trials`) given up: its cost passed its budget.
+    abort: Option<usize>,
+}
+
+/// A partition candidate on trial: the costs of the blocks and partitions
+/// it has coded (a lower bound of its own cost: the partition symbols
+/// between them are left out), and the cost to beat.
+struct Trial {
+    spent: f64,
+    budget: f64,
+}
+
+/// The error that unwinds a trial given up (`Rdo::abort` says which); the
+/// search that started the trial catches it.
+fn abandoned() -> crate::Error {
+    crate::Error::Unsupported(String::new())
 }
 
 /// The state of a rectangle of the frame, as trial coding may change it.
@@ -268,12 +287,7 @@ impl TileDecoder<'_, '_> {
             for y in y0..y1 {
                 let a = &e.src[p][y * st + x0..y * st + x1.max(x0)];
                 let b = &pl.data[y * pl.stride + x0..y * pl.stride + x1.max(x0)];
-                let mut s = 0u64;
-                for (&u, &v) in a.iter().zip(b) {
-                    let d = u as i64 - v as i64;
-                    s += (d * d) as u64;
-                }
-                total += s;
+                total += crate::dsp::enc::sse_row(a, b);
             }
         }
         total
@@ -299,6 +313,22 @@ impl TileDecoder<'_, '_> {
         };
         rdo.log.push(Decision::Partition(p as u8));
         Some(p)
+    }
+
+    /// Adds the cost of a block or partition just decided to the
+    /// innermost trial; gives the trial up (an error the trial's search
+    /// catches) when it can no longer win.
+    fn spend(&mut self, cost: f64) -> Result<()> {
+        let rdo = self.rdo();
+        let n = rdo.trials.len();
+        if let Some(t) = rdo.trials.last_mut() {
+            t.spent += cost;
+            if t.spent > t.budget {
+                rdo.abort = Some(n - 1);
+                return Err(abandoned());
+            }
+        }
+        Ok(())
     }
 
     /// The partition of a block: replayed, forced, or searched.
@@ -368,12 +398,47 @@ impl TileDecoder<'_, '_> {
             self.rdo().forced_partition = Some(p);
             self.rdo().nonzero = 0;
             let bits0 = self.sd.trial_bits();
-            self.decode_partition(r, c, b_size)?;
+            let depth = self.rdo().trials.len();
+            let budget = if tools.abandon_trials {
+                best.0
+            } else {
+                f64::MAX
+            };
+            self.rdo().trials.push(Trial { spent: 0.0, budget });
+            if let Err(e) = self.decode_partition(r, c, b_size) {
+                let rdo = self.rdo();
+                if rdo.abort != Some(depth) {
+                    return Err(e);
+                }
+                // Given up: it costs more than the best already.
+                rdo.abort = None;
+                rdo.trials.truncate(depth);
+                rdo.replay.clear();
+                rdo.forced_partition = None;
+                rdo.forced_plan = None;
+                rdo.forced_tx_type = None;
+                rdo.log.truncate(log_start);
+                continue;
+            }
+            self.rdo().trials.truncate(depth);
             let bits = self.sd.trial_bits() - bits0;
             let sse = self.rect_sse(snap.r0, snap.r1, snap.c0, snap.c1);
             let cost = self.rd_cost(sse, bits);
             if p == PARTITION_NONE {
                 none_flat = self.rdo().nonzero == 0;
+                // Or one whose cost per sample is low already.
+                let thr = if b_size >= BLOCK_32X32 {
+                    tools.split_threshold
+                } else {
+                    tools.split_threshold_small
+                } as f64;
+                if thr > 0.0 {
+                    let area = (block_width(b_size) * block_height(b_size)) as f64;
+                    let lambda = self.enc.as_ref().expect("encode mode").rd_lambda;
+                    if cost < thr / 100.0 * lambda * area {
+                        none_flat = true;
+                    }
+                }
             }
             if p == PARTITION_SPLIT && split_first {
                 // Whole (or halved): none of the sub-blocks split again.
@@ -397,6 +462,7 @@ impl TileDecoder<'_, '_> {
         // its caller codes that, then replays the rest.
         rdo.replay.extend(best.2.into_iter().skip(1));
         rdo.log.push(Decision::Partition(best.1 as u8));
+        self.spend(best.0)?;
         Ok(best.1)
     }
 
@@ -452,6 +518,8 @@ impl TileDecoder<'_, '_> {
         };
         let refine = tools.tx_type_rd || tools.tx_size;
         let mut fast_best: (f64, Plan) = (f64::MAX, cands[0]);
+        let mut fast_zero = false;
+        let mut best_inter_fast = f64::MAX;
         for &p in &cands {
             let (cost, zero, seg) = trial(self, p, refine)?;
             if cost < best.0 {
@@ -459,9 +527,17 @@ impl TileDecoder<'_, '_> {
             }
             if cost < fast_best.0 && !p.skip {
                 fast_best = (cost, p);
+                fast_zero = zero;
+            }
+            let inter_best_here = p.is_inter && cost < best_inter_fast;
+            if p.is_inter {
+                best_inter_fast = best_inter_fast.min(cost);
             }
             // No residual: the skip flag says so for less.
-            if !p.skip && (zero || (p.is_inter && tools.rd_skip)) {
+            if !p.skip
+                && (zero
+                    || (p.is_inter && tools.rd_skip && (!tools.rd_skip_best || inter_best_here)))
+            {
                 let mut q = p;
                 q.skip = true;
                 q.tx_depth = 0;
@@ -473,19 +549,49 @@ impl TileDecoder<'_, '_> {
         }
         // The best coded block: its transform types searched, at each
         // transform depth.
-        if refine && fast_best.0 < f64::MAX {
+        // (A best coded without coefficients is not refined.)
+        if refine && fast_best.0 < f64::MAX && !(tools.fast_tx_refine && fast_zero) {
             let base = fast_best.1;
             let max_depth = if tools.tx_size {
                 self.max_tx_depth(size, base.is_inter)
+                    .min(tools.tx_depth_max as usize)
             } else {
                 0
             };
-            for d in 0..=max_depth {
-                let mut q = base;
-                q.tx_depth = d as u8;
-                let (cost, _, seg) = trial(self, q, false)?;
-                if cost < best.0 {
-                    best = (cost, q, seg);
+            if tools.fast_tx_refine {
+                // The depths with the DCT, then the transform types at the
+                // best of them.
+                let mut best_d = (fast_best.0, base.tx_depth);
+                for d in 0..=max_depth {
+                    if d as u8 == base.tx_depth {
+                        continue;
+                    }
+                    let mut q = base;
+                    q.tx_depth = d as u8;
+                    let (cost, _, seg) = trial(self, q, true)?;
+                    if cost < best_d.0 {
+                        best_d = (cost, q.tx_depth);
+                    }
+                    if cost < best.0 {
+                        best = (cost, q, seg);
+                    }
+                }
+                if tools.tx_type_rd {
+                    let mut q = base;
+                    q.tx_depth = best_d.1;
+                    let (cost, _, seg) = trial(self, q, false)?;
+                    if cost < best.0 {
+                        best = (cost, q, seg);
+                    }
+                }
+            } else {
+                for d in 0..=max_depth {
+                    let mut q = base;
+                    q.tx_depth = d as u8;
+                    let (cost, _, seg) = trial(self, q, false)?;
+                    if cost < best.0 {
+                        best = (cost, q, seg);
+                    }
                 }
             }
         }
@@ -502,6 +608,7 @@ impl TileDecoder<'_, '_> {
         let rdo = self.rdo();
         rdo.replay.extend(best.2.into_iter().skip(1));
         rdo.log.push(Decision::Block(best.1));
+        self.spend(best.0)?;
         Ok(())
     }
 

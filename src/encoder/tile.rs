@@ -15,8 +15,9 @@ use crate::consts::*;
 use crate::decoder::predict::block_inter_prediction;
 use crate::decoder::state::Mv;
 use crate::decoder::tile::{Plan, TileDecoder};
+use crate::dsp::enc::{sad, satd};
 use crate::encoder::Tools;
-use crate::encoder::fwd::forward_2d;
+use crate::encoder::fwd::{coef_bound, forward_2d};
 use crate::encoder::rdo::{Decision, Rdo};
 use crate::symbol::Coder;
 use crate::tables::*;
@@ -51,6 +52,10 @@ pub(crate) struct EncCtx {
     pub(crate) lr_plan: Option<std::sync::Arc<crate::encoder::lr::LrPlan>>,
     /// The palette indices of the block being coded (palette blocks).
     pub(crate) palette_map: Box<[[u8; 64]; 64]>,
+    /// The last vector the motion search found over each 8x8 block, per
+    /// reference (`(ref_frame - LAST_FRAME) * cells + cell`): starting
+    /// points for the searches of the blocks around and above it.
+    pub(crate) me_hints: Vec<Mv>,
 }
 
 impl EncCtx {
@@ -59,43 +64,34 @@ impl EncCtx {
     }
 }
 
-/// Sum of absolute 4x4 Hadamard-transformed differences.
-fn satd(a: &[i32], b: &[i32], w: usize, h: usize) -> u64 {
-    let mut total = 0u64;
-    for by in (0..h).step_by(4) {
-        for bx in (0..w).step_by(4) {
-            let mut d = [0i32; 16];
-            for i in 0..4 {
-                for j in 0..4 {
-                    d[i * 4 + j] = a[(by + i) * w + bx + j] - b[(by + i) * w + bx + j];
-                }
-            }
-            for i in 0..4 {
-                let (a0, a1, a2, a3) = (d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]);
-                let (s0, s1, d0, d1) = (a0 + a1, a2 + a3, a0 - a1, a2 - a3);
-                d[i * 4] = s0 + s1;
-                d[i * 4 + 1] = s0 - s1;
-                d[i * 4 + 2] = d0 + d1;
-                d[i * 4 + 3] = d0 - d1;
-            }
-            for j in 0..4 {
-                let (a0, a1, a2, a3) = (d[j], d[4 + j], d[8 + j], d[12 + j]);
-                let (s0, s1, d0, d1) = (a0 + a1, a2 + a3, a0 - a1, a2 - a3);
-                total +=
-                    ((s0 + s1).abs() + (s0 - s1).abs() + (d0 + d1).abs() + (d0 - d1).abs()) as u64;
-            }
-        }
-    }
-    total / 2
-}
-
-/// Approximate bits of a motion vector difference component.
+/// Approximate bits of a motion vector difference component:
+/// `3 + 2 log2(|d| / 2 + 1)` (a piecewise-linear log2), 1 for none.
 fn mv_bits(d: i32) -> f64 {
     if d == 0 {
         1.0
     } else {
-        3.0 + 2.0 * ((d.unsigned_abs() as f64 / 2.0) + 1.0).log2()
+        let v = d.unsigned_abs() + 2;
+        let e = 31 - v.leading_zeros();
+        let frac = (v - (1 << e)) as f64 / (1u32 << e) as f64;
+        1.0 + 2.0 * (e as f64 + frac)
     }
+}
+
+/// The eight neighbours of a point, as `(dy, dx)`.
+const SQUARE8: [(i32, i32); 8] = [
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (-1, 1),
+    (1, -1),
+    (1, 1),
+];
+
+thread_local! {
+    /// Scratch for inter predictions.
+    static PRED: std::cell::RefCell<[Vec<i32>; 2]> = const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
 }
 
 /// The luma intra modes the encoder tries, with a rough cost in bits for
@@ -263,15 +259,15 @@ impl TileDecoder<'_, '_> {
     fn region_satd(&self, plane: usize, x: usize, y: usize, w: usize, h: usize) -> u64 {
         let e = self.enc();
         let cur = &self.f.cur.planes[plane];
-        let mut a = vec![0i32; w * h];
-        let mut b = vec![0i32; w * h];
-        for i in 0..h {
-            for j in 0..w {
-                a[i * w + j] = e.src(plane, x + j, y + i);
-                b[i * w + j] = cur.get(x + j, y + i) as i32;
-            }
-        }
-        satd(&a, &b, w.max(4), h.max(4))
+        let st = e.stride[plane];
+        satd(
+            &e.src[plane][y * st + x..],
+            st,
+            &cur.data[y * cur.stride + x..],
+            cur.stride,
+            w.max(4),
+            h.max(4),
+        )
     }
 
     /// Predicts `plane` with intra `mode` as `transform_block()` would and
@@ -479,7 +475,7 @@ impl TileDecoder<'_, '_> {
         let best_inter = inter.first().map_or(f64::MAX, |x| x.1);
         let intra_keep = out
             .into_iter()
-            .filter(|(_, score)| *score < best_inter * 1.5)
+            .filter(|(_, score)| *score < best_inter * if tools.prune_intra { 1.0 } else { 1.5 })
             .map(|(p, _)| p);
         let mut all: Vec<Plan> = inter
             .iter()
@@ -841,7 +837,8 @@ impl TileDecoder<'_, '_> {
             let y = (self.b.mi_row >> sub_y) * MI_SIZE;
             let w = block_width(self.b.mi_size) >> sub_x;
             let h = block_height(self.b.mi_size) >> sub_y;
-            let pred = self.inter_pred(plane, x, y, w, h, LAST_FRAME, mv);
+            let mut pred = Vec::new();
+            self.inter_pred(plane, x, y, w, h, LAST_FRAME, mv, &mut pred);
             let maxv = (1i32 << self.f.bit_depth) - 1;
             let cur = &mut self.f.cur.planes[plane];
             for i in 0..h {
@@ -872,7 +869,8 @@ impl TileDecoder<'_, '_> {
         h: usize,
         ref_frame: i32,
         mv: Mv,
-    ) -> Vec<i32> {
+        pred: &mut Vec<i32>,
+    ) {
         let ref_idx = self.f.hdr.ref_frame_idx[(ref_frame - LAST_FRAME) as usize];
         let r = self.f.refs[ref_idx].as_ref().expect("a reference");
         let (sx, sy, stx, sty) = self.f.scale_mv(
@@ -887,7 +885,9 @@ impl TileDecoder<'_, '_> {
         let last_x = ((r.upscaled_width as i32 + ssx as i32) >> ssx) - 1;
         let last_y = ((r.frame_height as i32 + ssy as i32) >> ssy) - 1;
         let rv = self.f.rounding_variables(false);
-        let mut pred = vec![0i32; w * h];
+        if pred.len() < w * h {
+            pred.resize(w * h, 0);
+        }
         let filt = self.f.hdr.interpolation_filter.min(BILINEAR) as u8;
         block_inter_prediction(
             &r.frame.planes[plane],
@@ -901,9 +901,8 @@ impl TileDecoder<'_, '_> {
             h,
             [filt, filt],
             rv,
-            &mut pred,
+            &mut pred[..w * h],
         );
-        pred
     }
 
     /// Luma SATD of the inter prediction from `ref_frame` with `mv`.
@@ -912,15 +911,12 @@ impl TileDecoder<'_, '_> {
         let h = block_height(self.b.mi_size);
         let x = self.b.mi_col * MI_SIZE;
         let y = self.b.mi_row * MI_SIZE;
-        let pred = self.inter_pred(0, x, y, w, h, ref_frame, mv);
-        let e = self.enc();
-        let mut src = vec![0i32; w * h];
-        for i in 0..h {
-            for j in 0..w {
-                src[i * w + j] = e.src(0, x + j, y + i);
-            }
-        }
-        satd(&src, &pred, w, h)
+        PRED.with_borrow_mut(|pred| {
+            self.inter_pred(0, x, y, w, h, ref_frame, mv, &mut pred[0]);
+            let e = self.enc();
+            let st = e.stride[0];
+            satd(&e.src[0][y * st + x..], st, &pred[0], w, w, h)
+        })
     }
 
     /// Luma SATD of the average of two single-reference predictions (an
@@ -930,23 +926,25 @@ impl TileDecoder<'_, '_> {
         let h = block_height(self.b.mi_size);
         let x = self.b.mi_col * MI_SIZE;
         let y = self.b.mi_row * MI_SIZE;
-        let p1 = self.inter_pred(0, x, y, w, h, r1, mv1);
-        let p2 = self.inter_pred(0, x, y, w, h, r2, mv2);
-        let e = self.enc();
-        let mut src = vec![0i32; w * h];
-        let mut avg = vec![0i32; w * h];
-        for i in 0..h {
-            for j in 0..w {
-                src[i * w + j] = e.src(0, x + j, y + i);
-                avg[i * w + j] = (p1[i * w + j] + p2[i * w + j] + 1) >> 1;
+        PRED.with_borrow_mut(|pred| {
+            let [p1, p2] = pred;
+            self.inter_pred(0, x, y, w, h, r1, mv1, p1);
+            self.inter_pred(0, x, y, w, h, r2, mv2, p2);
+            for (a, &b) in p1[..w * h].iter_mut().zip(&p2[..w * h]) {
+                *a = (*a + b + 1) >> 1;
             }
-        }
-        satd(&src, &avg, w, h)
+            let e = self.enc();
+            let st = e.stride[0];
+            satd(&e.src[0][y * st + x..], st, &p1[..], w, w, h)
+        })
     }
 
-    /// A full-pel search around the predicted and zero vectors, then
-    /// half- and quarter-sample refinement with the normative predictor.
-    fn motion_search(&self, ref_frame: i32, pred_mv: Mv) -> Mv {
+    /// The motion search: full-pel, then half- and quarter- (and eighth-)
+    /// sample refinement with the normative predictor. Exhaustive in a
+    /// window around the predicted and zero vectors, or (`Tools::fast_me`)
+    /// descending square steps from the best of the predicted, stacked,
+    /// neighbouring and zero vectors.
+    fn motion_search(&mut self, ref_frame: i32, pred_mv: Mv) -> Mv {
         let w = block_width(self.b.mi_size);
         let h = block_height(self.b.mi_size);
         let x0 = (self.b.mi_col * MI_SIZE) as i32;
@@ -956,8 +954,29 @@ impl TileDecoder<'_, '_> {
         let rp = &r.frame.planes[0];
         let last_x = r.upscaled_width as i32 - 1;
         let last_y = r.frame_height as i32 - 1;
-        let e = self.enc();
+        let e = self.enc.as_ref().expect("encode mode");
+        let fast = e.tools.fast_me;
+        // The 8x8 cells of the hint grid.
+        let cols8 = self.f.mi_cols.div_ceil(2);
+        let cells = cols8 * self.f.mi_rows.div_ceil(2);
         let sad = |dx: i32, dy: i32, best: u64| -> u64 {
+            let inside = x0 + dx >= 0
+                && x0 + dx + w as i32 - 1 <= last_x
+                && y0 + dy >= 0
+                && y0 + dy + h as i32 - 1 <= last_y;
+            if inside {
+                let st = e.stride[0];
+                let ro = (y0 + dy) as usize * rp.stride + (x0 + dx) as usize;
+                return sad(
+                    &e.src[0][y0 as usize * st + x0 as usize..],
+                    st,
+                    &rp.data[ro..],
+                    rp.stride,
+                    w,
+                    h,
+                    best,
+                );
+            }
             let mut s = 0u64;
             let inside = x0 + dx >= 0 && x0 + dx + w as i32 - 1 <= last_x;
             for i in 0..h as i32 {
@@ -967,19 +986,15 @@ impl TileDecoder<'_, '_> {
                 let srow = &e.src[0][so..so + w];
                 if inside {
                     let r0 = (x0 + dx) as usize;
-                    let mut acc = 0u32;
-                    for (&a, &b) in srow.iter().zip(&row[r0..r0 + w]) {
-                        acc += (a as i32 - b as i32).unsigned_abs();
-                    }
-                    s += acc as u64;
+                    s += sad(srow, w, &row[r0..r0 + w], w, w, 1, u64::MAX);
                 } else {
                     for j in 0..w as i32 {
                         let rx = (x0 + j + dx).clamp(0, last_x) as usize;
                         s += (srow[j as usize] as i32 - row[rx] as i32).unsigned_abs() as u64;
                     }
                 }
-                if s >= best {
-                    return s;
+                if s > best {
+                    return u64::MAX;
                 }
             }
             s
@@ -987,7 +1002,16 @@ impl TileDecoder<'_, '_> {
         let lambda = e.lambda;
         let cost = |dx: i32, dy: i32, best: f64| -> f64 {
             let bits = mv_bits(dy * 8 - pred_mv[0]) + mv_bits(dx * 8 - pred_mv[1]);
-            sad(dx, dy, best.min(1e18) as u64) as f64 + lambda * bits
+            let rate = lambda * bits;
+            if rate >= best {
+                return f64::MAX;
+            }
+            let s = sad(dx, dy, (best - rate).min(1e18) as u64);
+            if s == u64::MAX {
+                f64::MAX
+            } else {
+                s as f64 + rate
+            }
         };
         let range = e.search_range;
         let mut best = (0i32, 0i32, cost(0, 0, f64::MAX));
@@ -996,61 +1020,151 @@ impl TileDecoder<'_, '_> {
         if c < best.2 {
             best = (pcx, pcy, c);
         }
-        let (cx, cy) = (best.0, best.1);
-        // A coarse square search (step 2), then a fine one around the best.
-        let mut step_best = best;
-        for dy in (-range..=range).step_by(2) {
-            for dx in (-range..=range).step_by(2) {
-                let c = cost(cx + dx, cy + dy, step_best.2);
-                if c < step_best.2 {
-                    step_best = (cx + dx, cy + dy, c);
+        if fast {
+            // Starting points: the stacked vectors and the vectors found
+            // over the 8x8 blocks this one covers and borders.
+            let mut starts: [(i32, i32); 16] = [(0, 0); 16];
+            let mut n = 0;
+            for k in 1..self.b.num_mv_found.min(3) {
+                let m = self.b.ref_stack_mv[k][0];
+                starts[n] = ((m[1] + 4) >> 3, (m[0] + 4) >> 3);
+                n += 1;
+            }
+            if e.me_hints.len() == cells * 7 {
+                let base = (ref_frame - LAST_FRAME) as usize * cells;
+                let (r8, c8) = (self.b.mi_row / 2, self.b.mi_col / 2);
+                let (h8, w8) = (h.div_ceil(8), w.div_ceil(8));
+                let rows8 = self.f.mi_rows.div_ceil(2);
+                for (dr, dc) in [
+                    (0, 0),
+                    (h8 / 2, w8 / 2),
+                    (0, w8 - 1),
+                    (h8 - 1, 0),
+                    (h8 - 1, w8 - 1),
+                    (usize::MAX, 0),
+                    (0, usize::MAX),
+                ] {
+                    let rr = r8.wrapping_add(dr);
+                    let cc = c8.wrapping_add(dc);
+                    if rr < rows8 && cc < cols8 && n < starts.len() {
+                        let m = e.me_hints[base + rr * cols8 + cc];
+                        starts[n] = ((m[1] + 4) >> 3, (m[0] + 4) >> 3);
+                        n += 1;
+                    }
                 }
             }
-        }
-        best = step_best;
-        let (cx, cy) = (best.0, best.1);
-        for dy in -2..=2 {
-            for dx in -2..=2 {
-                let c = cost(cx + dx, cy + dy, best.2);
+            for (k, &(sx, sy)) in starts[..n].iter().enumerate() {
+                if (sx, sy) == (0, 0)
+                    || (sx, sy) == (pcx, pcy)
+                    || starts[..k].contains(&(sx, sy))
+                    || sx.abs() > 4 * range
+                    || sy.abs() > 4 * range
+                {
+                    continue;
+                }
+                let c = cost(sx, sy, best.2);
                 if c < best.2 {
-                    best = (cx + dx, cy + dy, c);
+                    best = (sx, sy, c);
+                }
+            }
+            // Descending square steps, moving while one improves.
+            let lim = 4 * range;
+            let mut step = (range / 2).max(1);
+            while step >= 1 {
+                for _ in 0..8 {
+                    let (cx, cy) = (best.0, best.1);
+                    for (dy, dx) in SQUARE8 {
+                        let (nx, ny) = (cx + dx * step, cy + dy * step);
+                        if nx.abs() > lim || ny.abs() > lim {
+                            continue;
+                        }
+                        let c = cost(nx, ny, best.2);
+                        if c < best.2 {
+                            best = (nx, ny, c);
+                        }
+                    }
+                    if (best.0, best.1) == (cx, cy) {
+                        break;
+                    }
+                }
+                step /= 2;
+            }
+        } else {
+            let (cx, cy) = (best.0, best.1);
+            // A coarse square search (step 2), then a fine one around the best.
+            let mut step_best = best;
+            for dy in (-range..=range).step_by(2) {
+                for dx in (-range..=range).step_by(2) {
+                    let c = cost(cx + dx, cy + dy, step_best.2);
+                    if c < step_best.2 {
+                        step_best = (cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            best = step_best;
+            let (cx, cy) = (best.0, best.1);
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let c = cost(cx + dx, cy + dy, best.2);
+                    if c < best.2 {
+                        best = (cx + dx, cy + dy, c);
+                    }
                 }
             }
         }
         let mut mv: Mv = [best.1 * 8, best.0 * 8];
-        if self.f.hdr.force_integer_mv {
-            return mv;
-        }
-        // Sub-sample refinement, in eighth samples: 4 then 2 (quarter).
-        let mut best_cost = self.inter_satd(ref_frame, mv) as f64
-            + lambda * (mv_bits(mv[0] - pred_mv[0]) + mv_bits(mv[1] - pred_mv[1]));
-        let min_step = if self.f.hdr.allow_high_precision_mv {
-            1
-        } else {
-            2
-        };
-        let mut step = 4;
-        while step >= min_step {
-            let center = mv;
-            for (dy, dx) in [
-                (-1, 0),
-                (1, 0),
-                (0, -1),
-                (0, 1),
-                (-1, -1),
-                (-1, 1),
-                (1, -1),
-                (1, 1),
-            ] {
-                let cand = [center[0] + dy * step, center[1] + dx * step];
-                let c = self.inter_satd(ref_frame, cand) as f64
-                    + lambda * (mv_bits(cand[0] - pred_mv[0]) + mv_bits(cand[1] - pred_mv[1]));
-                if c < best_cost {
-                    best_cost = c;
-                    mv = cand;
+        if !self.f.hdr.force_integer_mv {
+            // Sub-sample refinement, in eighth samples: 4 (half), 2
+            // (quarter), then 1 with high precision.
+            let mut best_cost = self.inter_satd(ref_frame, mv) as f64
+                + lambda * (mv_bits(mv[0] - pred_mv[0]) + mv_bits(mv[1] - pred_mv[1]));
+            let min_step = if self.f.hdr.allow_high_precision_mv {
+                1
+            } else {
+                2
+            };
+            let mut step = 4;
+            while step >= min_step {
+                let center = mv;
+                let try_mv = |t: &Self, dy: i32, dx: i32, mv: &mut Mv, best_cost: &mut f64| {
+                    let cand = [center[0] + dy * step, center[1] + dx * step];
+                    let c = t.inter_satd(ref_frame, cand) as f64
+                        + lambda * (mv_bits(cand[0] - pred_mv[0]) + mv_bits(cand[1] - pred_mv[1]));
+                    if c < *best_cost {
+                        *best_cost = c;
+                        *mv = cand;
+                    }
+                    c
+                };
+                if fast {
+                    // The cross, then the diagonal between its better
+                    // vertical and horizontal neighbours.
+                    let up = try_mv(self, -1, 0, &mut mv, &mut best_cost);
+                    let down = try_mv(self, 1, 0, &mut mv, &mut best_cost);
+                    let left = try_mv(self, 0, -1, &mut mv, &mut best_cost);
+                    let right = try_mv(self, 0, 1, &mut mv, &mut best_cost);
+                    let dy = if up < down { -1 } else { 1 };
+                    let dx = if left < right { -1 } else { 1 };
+                    try_mv(self, dy, dx, &mut mv, &mut best_cost);
+                } else {
+                    for (dy, dx) in SQUARE8 {
+                        try_mv(self, dy, dx, &mut mv, &mut best_cost);
+                    }
                 }
+                step /= 2;
             }
-            step /= 2;
+        }
+        // Remember the vector over the 8x8 blocks this one covers.
+        let e = self.enc.as_mut().expect("encode mode");
+        if e.me_hints.len() != cells * 7 {
+            e.me_hints = vec![[0, 0]; cells * 7];
+        }
+        let base = (ref_frame - LAST_FRAME) as usize * cells;
+        let rows8 = self.f.mi_rows.div_ceil(2);
+        for rr in self.b.mi_row / 2..((self.b.mi_row * MI_SIZE + h) / 8).min(rows8) {
+            for cc in self.b.mi_col / 2..((self.b.mi_col * MI_SIZE + w) / 8).min(cols8) {
+                e.me_hints[base + rr * cols8 + cc] = mv;
+            }
         }
         mv
     }
@@ -1074,6 +1188,7 @@ impl TileDecoder<'_, '_> {
         let mut c = std::mem::take(&mut self.enc.as_mut().expect("encode mode").fc);
         res.resize(64 * 64, 0);
         c.resize(64 * 64, 0.0);
+        let mut sum_abs = 0u32;
         {
             let e = self.enc();
             let cur = &self.f.cur.planes[plane];
@@ -1087,10 +1202,10 @@ impl TileDecoder<'_, '_> {
                     .zip(srow.iter().zip(crow))
                 {
                     *r = a as i32 - b as i32;
+                    sum_abs += r.unsigned_abs();
                 }
             }
         }
-        forward_2d(&res[..w * h], tx_sz, tx_type, &mut c[..w * h]);
         let bd = self.f.bit_depth;
         let bdi = ((bd - 8) >> 1) as usize;
         let (dc_delta, ac_delta) = match plane {
@@ -1106,21 +1221,30 @@ impl TileDecoder<'_, '_> {
             TX_64X64 | TX_32X64 | TX_64X32 => 4.0,
             _ => 1.0,
         };
+        let (dc_r, ac_r) = (denom / dc_q, denom / ac_q);
+        // Every level zero when no coefficient can reach the dead zones.
+        let top = sum_abs as f64 * coef_bound(tx_sz, tx_type);
         let enc = self.enc.as_mut().expect("encode mode");
         enc.coefs.fill(0);
+        if top * ac_r < 0.62 && top * dc_r < 0.5 {
+            enc.res = res;
+            enc.fc = c;
+            self.plane_tx_type = tx_type;
+            return 0;
+        }
+        forward_2d(&res[..w * h], tx_sz, tx_type, &mut c[..w * h]);
+        const MAX_LEVEL: f64 = ((1 << 20) - 1) as f64;
         for i in 0..th {
-            for j in 0..tw {
-                let v = c[i * w + j];
-                let (qs, dz) = if i == 0 && j == 0 {
-                    (dc_q, 0.5)
-                } else {
-                    (ac_q, 0.62)
-                };
-                let a = v.abs() * denom / qs;
-                let l = (a + 1.0 - dz).floor().max(0.0).min(((1 << 20) - 1) as f64) as i32;
-                enc.coefs[i * tw + j] = if v < 0.0 { -l } else { l };
+            let row = &c[i * w..i * w + tw];
+            let out = &mut enc.coefs[i * tw..(i + 1) * tw];
+            for (o, &v) in out.iter_mut().zip(row) {
+                let l = (v.abs() * ac_r + (1.0 - 0.62)).floor().min(MAX_LEVEL) as i32;
+                *o = if v < 0.0 { -l } else { l };
             }
         }
+        let v = c[0];
+        let l = (v.abs() * dc_r + 0.5).floor().min(MAX_LEVEL) as i32;
+        enc.coefs[0] = if v < 0.0 { -l } else { l };
         enc.res = res;
         enc.fc = c;
         // The end of block in the scan the decoder will use.
@@ -1149,10 +1273,10 @@ impl TileDecoder<'_, '_> {
         let st = e.stride[plane];
         let mut s = 0u64;
         for y in y0..y1 {
-            for x in x0..x1 {
-                let d = e.src[plane][y * st + x] as i64 - pl.data[y * pl.stride + x] as i64;
-                s += (d * d) as u64;
-            }
+            s += crate::dsp::enc::sse_row(
+                &e.src[plane][y * st + x0..y * st + x1.max(x0)],
+                &pl.data[y * pl.stride + x0..y * pl.stride + x1.max(x0)],
+            );
         }
         s
     }

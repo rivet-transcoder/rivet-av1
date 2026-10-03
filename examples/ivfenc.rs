@@ -5,7 +5,9 @@
 //! cargo run --release --example ivfenc -- input.y4m output.ivf [QUANTIZER] [settings]
 //!
 //! Settings are `name=value`: `speed`, `tiles` (tile columns, log2),
-//! `threads`, `frames` (at most this many), `key` (key frame interval).
+//! `threads`, `frames` (at most this many), `key` (key frame interval),
+//! `bitrate` (bits per second at 30 frames/s), and the `Tools` switches
+//! by name (after `speed`).
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -71,7 +73,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(("threads", v)) => cfg.threads = v.parse()?,
             Some(("frames", v)) => max_frames = v.parse()?,
             Some(("key", v)) => cfg.keyframe_interval = v.parse()?,
-            Some((k, _)) => return Err(format!("unknown setting {k}").into()),
+            Some(("bitrate", v)) => {
+                // Bits per second at 30 frames/s.
+                cfg.target_bits_per_frame = Some(v.parse::<u64>()? / 30);
+            }
+            Some((k, v)) => {
+                if !cfg.tools.set(k, v.parse()?) {
+                    return Err(format!("unknown setting {k}").into());
+                }
+            }
         }
     }
     let mut enc = av1::Encoder::new(cfg);

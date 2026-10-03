@@ -19,6 +19,7 @@ pub(crate) mod fwd;
 pub(crate) mod lr;
 pub(crate) mod rdo;
 pub(crate) mod tile;
+mod wavefront;
 
 use std::sync::Arc;
 
@@ -136,6 +137,39 @@ pub struct Tools {
     /// Palettes (screen content tools) on frames that look like screen
     /// content: few colours, sharp edges.
     pub palette: bool,
+    /// Motion search by descending square steps from the best of the
+    /// predicted, neighbouring and zero vectors (else an exhaustive window
+    /// around the predicted one), and a cross-shaped sub-sample refinement.
+    pub fast_me: bool,
+    /// The transform depths tried with the DCT alone, the transform types
+    /// then searched at the best depth only.
+    pub fast_tx_refine: bool,
+    /// The restoration search fits its filters on a quarter of the
+    /// samples and tries fewer self-guided parameter sets.
+    pub restoration_fast: bool,
+    /// A partition candidate is given up as soon as the blocks it has
+    /// coded cost more than the best candidate before it (a lossless
+    /// shortcut: such a candidate cannot win).
+    pub abandon_trials: bool,
+    /// A block of 32x32 or more is not split when coding it whole costs
+    /// less than this many hundredths of the Lagrange multiplier per
+    /// sample (0: off).
+    pub split_threshold: u16,
+    /// The same for the smaller blocks.
+    pub split_threshold_small: u16,
+    /// The residual of inter blocks is tried skipped only for the best
+    /// inter candidate (with `rd_skip`).
+    pub rd_skip_best: bool,
+    /// The deepest transform split searched (0 to 2).
+    pub tx_depth_max: u8,
+    /// Intra candidates are trialled in inter frames only when their
+    /// SATD cost beats the best inter candidate's (else within 1.5x).
+    pub prune_intra: bool,
+    /// The decisions searched in superblock rows in a wavefront (each row
+    /// adapting its own CDFs from the row above's), on `Config::threads`
+    /// threads, then the frame coded again with them. The output does not
+    /// depend on the thread count.
+    pub wavefront: bool,
 }
 
 impl Tools {
@@ -147,7 +181,7 @@ impl Tools {
             partition_rect: s <= 5,
             partition_4x4: s <= 1,
             prune_split: s >= 3,
-            prune_partition: s >= 5,
+            prune_partition: s >= 7,
             rd_skip: s <= 7,
             tx_size: s <= 6,
             tx_type_rd: s <= 8,
@@ -179,6 +213,23 @@ impl Tools {
             restoration_thorough: s <= 2,
             compound: s <= 5,
             palette: s <= 8,
+            fast_me: s >= 5,
+            fast_tx_refine: s >= 5,
+            restoration_fast: s >= 5,
+            abandon_trials: true,
+            split_threshold: match s {
+                0..=4 => 0,
+                _ => 15,
+            },
+            split_threshold_small: match s {
+                0..=4 => 0,
+                5 => 100,
+                _ => 200,
+            },
+            rd_skip_best: s >= 5,
+            tx_depth_max: if s >= 6 { 1 } else { 2 },
+            prune_intra: s >= 5,
+            wavefront: s >= 5,
         }
     }
 
@@ -208,6 +259,16 @@ impl Tools {
             "restoration_thorough" => self.restoration_thorough = b,
             "compound" => self.compound = b,
             "palette" => self.palette = b,
+            "fast_me" => self.fast_me = b,
+            "fast_tx_refine" => self.fast_tx_refine = b,
+            "restoration_fast" => self.restoration_fast = b,
+            "abandon_trials" => self.abandon_trials = b,
+            "split_threshold" => self.split_threshold = value.min(65535) as u16,
+            "split_threshold_small" => self.split_threshold_small = value.min(65535) as u16,
+            "rd_skip_best" => self.rd_skip_best = b,
+            "tx_depth_max" => self.tx_depth_max = value.min(2) as u8,
+            "prune_intra" => self.prune_intra = b,
+            "wavefront" => self.wavefront = b,
             _ => return false,
         }
         true
@@ -460,7 +521,7 @@ impl Encoder {
         let src = Arc::new(src);
         let tools = self.cfg.tools;
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
-        if tools.lf_search || tools.cdef || tools.restoration {
+        if tools.lf_search || tools.cdef || tools.restoration || coded.tiles.is_empty() {
             // The in-loop filters' parameters, chosen on the first pass's
             // reconstruction; then the frame again with them, replaying the
             // first pass's decisions.
@@ -501,7 +562,13 @@ impl Encoder {
                     &src,
                     &stride,
                     lambda,
-                    tools.restoration_thorough,
+                    if tools.restoration_thorough {
+                        lr::Effort::Thorough
+                    } else if tools.restoration_fast {
+                        lr::Effort::Fast
+                    } else {
+                        lr::Effort::Normal
+                    },
                 );
                 p.lr = Some(plan.frame_type);
                 lr_plan = Some(Arc::new(plan));
@@ -727,6 +794,28 @@ impl Encoder {
             };
             Ok((e.finish(), log, saved))
         };
+        if replay.is_none() && self.cfg.tools.wavefront {
+            // The search alone, in a wavefront per tile; the caller codes
+            // the frame again with its decisions.
+            let mut logs = Vec::with_capacity(num_tiles);
+            let threads = self.cfg.threads.max(1);
+            for t in 0..num_tiles {
+                let make = || self.enc_ctx(p, src, stride);
+                logs.push(wavefront::search_tile(
+                    &mut f,
+                    t / ti.cols,
+                    t % ti.cols,
+                    threads,
+                    &make,
+                )?);
+            }
+            return Ok(Coded {
+                f,
+                header,
+                tiles: Vec::new(),
+                logs,
+            });
+        }
         let threads = self.cfg.threads.max(1).min(num_tiles);
         let outs: Vec<Result<TileOut>> = if threads > 1 {
             // Tiles are independent: each is coded into a frame state of its
@@ -789,6 +878,7 @@ impl Encoder {
             cdef_table: None,
             lr_plan: None,
             palette_map: Box::new([[0; 64]; 64]),
+            me_hints: Vec::new(),
         })
     }
 
@@ -1063,10 +1153,7 @@ fn plane_sse(f: &crate::decoder::FrameCtx, src: &[Vec<u16>], stride: &[usize], p
     for y in 0..h {
         let a = &src[p][y * stride[p]..y * stride[p] + w];
         let b = &pl.data[y * pl.stride..y * pl.stride + w];
-        for (&u, &v) in a.iter().zip(b) {
-            let d = u as i64 - v as i64;
-            s += (d * d) as u64;
-        }
+        s += crate::dsp::enc::sse_row(a, b);
     }
     s
 }

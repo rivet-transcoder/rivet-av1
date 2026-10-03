@@ -35,7 +35,20 @@ pub(crate) struct LrPlan {
 }
 
 /// The self-guided parameter sets tried.
-const SGR_SETS_FAST: [usize; 6] = [0, 3, 6, 10, 13, 14];
+const SGR_SETS_NORMAL: [usize; 6] = [0, 3, 6, 10, 13, 14];
+const SGR_SETS_FAST: [usize; 2] = [3, 10];
+
+/// How hard the search works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effort {
+    /// Filters fitted on every other row and column; two self-guided
+    /// parameter sets.
+    Fast,
+    /// Six self-guided parameter sets.
+    Normal,
+    /// All sixteen.
+    Thorough,
+}
 
 /// Chooses the restoration of every unit of every plane of `f` (whose
 /// header asks for switchable restoration in each, so its unit arrays are
@@ -48,14 +61,15 @@ pub(crate) fn search(
     src: &[Vec<u16>],
     stride: &[usize],
     lambda: f64,
-    thorough: bool,
+    effort: Effort,
 ) -> LrPlan {
     let mut plan = LrPlan::default();
-    let sets: Vec<usize> = if thorough {
-        (0..16).collect()
-    } else {
-        SGR_SETS_FAST.to_vec()
+    let sets: Vec<usize> = match effort {
+        Effort::Thorough => (0..16).collect(),
+        Effort::Normal => SGR_SETS_NORMAL.to_vec(),
+        Effort::Fast => SGR_SETS_FAST.to_vec(),
     };
+    let step = if effort == Effort::Fast { 2 } else { 1 };
     let stripes = (f.hdr.frame_height as usize + 8).div_ceil(64);
     for plane in 0..f.num_planes {
         let lp = &f.lr[plane];
@@ -131,7 +145,7 @@ pub(crate) fn search(
                 let none = sse_of(&mut buf, None);
                 let mut best = (none as f64 + lambda, LrChoice::default());
                 // Wiener.
-                let coef = fit_wiener(f, plane, &rects, x0, w, src, stride, &mut buf);
+                let coef = fit_wiener(plane, &rects, x0, w, src, stride, step, &mut buf);
                 let p = LrParams::Wiener(coef);
                 let e = sse_of(&mut buf, Some(&p));
                 let cost = e as f64 + lambda * if plane == 0 { 40.0 } else { 28.0 };
@@ -147,7 +161,8 @@ pub(crate) fn search(
                 }
                 // Self-guided.
                 for &set in &sets {
-                    let (xqd, e) = fit_sgr(f, set, &rects, x0, w, src, stride, plane, &mut buf);
+                    let (xqd, e) =
+                        fit_sgr(f, set, &rects, x0, w, src, stride, plane, step, &mut buf);
                     let cost = e as f64 + lambda * 20.0;
                     if cost < best.0 {
                         best = (
@@ -210,16 +225,15 @@ fn solve<const N: usize>(mut m: [[f64; N]; N], mut v: [f64; N]) -> [f64; N] {
 /// ranges: `[vertical, horizontal]` coefficients (outermost first).
 #[allow(clippy::too_many_arguments)]
 fn fit_wiener(
-    f: &FrameCtx,
     plane: usize,
     rects: &[(LrCtx, i32, usize)],
     x0: i32,
     w: usize,
     src: &[Vec<u16>],
     stride: &[usize],
+    step: usize,
     buf: &mut LrBuffers,
 ) -> [[i32; 3]; 2] {
-    let _ = f;
     // Chroma filters have no outermost tap.
     let first = if plane == 0 { 0 } else { 1 };
     let ww = w + 2 * LRB;
@@ -234,9 +248,9 @@ fn fit_wiener(
             lr_window(ctx, x0, *y0, w, *h, buf);
             let win = &buf.win;
             let at = |r: usize, c: usize| win[r * ww + c] as f64;
-            for i in 0..*h {
+            for i in (0..*h).step_by(step) {
                 let so = (*y0 as usize + i) * stride[plane] + x0 as usize;
-                for j in 0..w {
+                for j in (0..w).step_by(step) {
                     // The other direction's filter applied first: the
                     // samples along this direction (7 of them).
                     let mut line = [0f64; 7];
@@ -311,6 +325,7 @@ fn fit_sgr(
     src: &[Vec<u16>],
     stride: &[usize],
     plane: usize,
+    step: usize,
     buf: &mut LrBuffers,
 ) -> ([i32; 2], u64) {
     let r0 = SGR_PARAMS[set][0];
@@ -325,9 +340,9 @@ fn fit_sgr(
             box_filter_rect(f, ctx, x0, *y0, w, *h, set, pass, buf);
         }
         flts.push([buf.flt[0].clone(), buf.flt[1].clone()]);
-        for i in 0..*h {
+        for i in (0..*h).step_by(step) {
             let so = (*y0 as usize + i) * stride[plane] + x0 as usize;
-            for j in 0..w {
+            for j in (0..w).step_by(step) {
                 let u = ((ctx.cdef.get(x0 as usize + j, *y0 as usize + i) as i32)
                     << SGRPROJ_RST_BITS) as f64;
                 let a = if r0 != 0 {
