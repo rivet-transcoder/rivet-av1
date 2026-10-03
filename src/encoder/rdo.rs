@@ -343,15 +343,28 @@ impl TileDecoder<'_, '_> {
         let log_start = self.rdo().log.len();
         let mut best: (f64, usize, Vec<Decision>) = (f64::MAX, cands[0], Vec::new());
         let mut none_flat = false;
-        for (i, &p) in cands.iter().enumerate() {
-            if i > 0 {
+        // Speed: the split first; when its sub-blocks did not stay whole,
+        // the block as one (or two) is not tried.
+        let split_first = tools.prune_partition && b_size > BLOCK_8X8;
+        if split_first && let Some(k) = cands.iter().position(|&p| p == PARTITION_SPLIT) {
+            cands.remove(k);
+            cands.insert(0, PARTITION_SPLIT);
+        }
+        let mut children_whole = true;
+        let mut first = true;
+        for &p in cands.iter() {
+            if !first {
                 self.restore(&snap);
             }
             // A flat block that codes with no residual as one block is not
             // split further (speed).
-            if p == PARTITION_SPLIT && none_flat && tools.prune_split {
+            if p == PARTITION_SPLIT && none_flat && tools.prune_split && !split_first {
                 continue;
             }
+            if split_first && p != PARTITION_SPLIT && !children_whole {
+                continue;
+            }
+            first = false;
             self.rdo().forced_partition = Some(p);
             self.rdo().nonzero = 0;
             let bits0 = self.sd.trial_bits();
@@ -361,6 +374,12 @@ impl TileDecoder<'_, '_> {
             let cost = self.rd_cost(sse, bits);
             if p == PARTITION_NONE {
                 none_flat = self.rdo().nonzero == 0;
+            }
+            if p == PARTITION_SPLIT && split_first {
+                // Whole (or halved): none of the sub-blocks split again.
+                children_whole = self.rdo().log[log_start + 1..].iter().all(
+                    |d| !matches!(d, Decision::Partition(q) if *q as usize == PARTITION_SPLIT),
+                );
             }
             if cost < best.0 {
                 let seg = self.rdo().log[log_start..].to_vec();

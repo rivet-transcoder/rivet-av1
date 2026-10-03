@@ -47,6 +47,10 @@ pub(crate) struct EncCtx {
     pub(crate) fc: Vec<f64>,
     /// Each 64x64 block's CDEF index, once searched (`cdef_idx` layout).
     pub(crate) cdef_table: Option<Vec<i8>>,
+    /// Each loop restoration unit's parameters, once searched.
+    pub(crate) lr_plan: Option<std::sync::Arc<crate::encoder::lr::LrPlan>>,
+    /// The palette indices of the block being coded (palette blocks).
+    pub(crate) palette_map: Box<[[u8; 64]; 64]>,
 }
 
 impl EncCtx {
@@ -332,20 +336,60 @@ impl TileDecoder<'_, '_> {
                 }
             }
         }
-        let mut out = Vec::new();
-        for &(m, _) in ys.iter().take(tools.intra_candidates.max(1) as usize) {
-            out.push(Plan {
-                y_mode: m,
-                uv_mode: best_uv,
-                ref_frame: INTRA_FRAME,
-                ..Default::default()
-            });
+        let mut out: Vec<(Plan, f64)> = Vec::new();
+        for &(m, score) in ys.iter().take(tools.intra_candidates.max(1) as usize) {
+            out.push((
+                Plan {
+                    y_mode: m,
+                    uv_mode: best_uv,
+                    ref_frame: INTRA_FRAME,
+                    ..Default::default()
+                },
+                score,
+            ));
+        }
+        // A palette, for blocks of few colours (screen content).
+        if self.f.hdr.allow_screen_content_tools
+            && (BLOCK_8X8..=BLOCK_64X64).contains(&ms)
+            && block_width(ms) <= 64
+            && block_height(ms) <= 64
+            && let Some((n, colors)) = self.palette_colors()
+        {
+            out.push((
+                Plan {
+                    y_mode: DC_PRED,
+                    uv_mode: best_uv,
+                    ref_frame: INTRA_FRAME,
+                    palette_n: n,
+                    palette_colors: colors,
+                    ..Default::default()
+                },
+                ys[0].1,
+            ));
+        }
+        // Chroma from luma, with the best luma mode.
+        if tools.cfl
+            && let Some((au, av)) = self.cfl_alphas()
+        {
+            out.push((
+                Plan {
+                    y_mode: ys[0].0,
+                    uv_mode: UV_CFL_PRED,
+                    cfl_alpha_u: au,
+                    cfl_alpha_v: av,
+                    ref_frame: INTRA_FRAME,
+                    ..Default::default()
+                },
+                ys[0].1,
+            ));
         }
         let refs = self.enc().refs.clone();
         if refs.is_empty() || ms < BLOCK_8X8 {
-            return out;
+            return out.into_iter().map(|x| x.0).collect();
         }
         let mut inter: Vec<(Plan, f64)> = Vec::new();
+        // The searched vector of each reference, for compound candidates.
+        let mut searched_mv: Vec<(i32, Mv)> = Vec::new();
         for &rf in &refs {
             self.b.ref_frame = [rf, NONE];
             self.b.is_inter = true;
@@ -360,6 +404,7 @@ impl TileDecoder<'_, '_> {
             cands.push((GLOBALMV, 0, self.b.global_mvs[0], 2.0));
             let pred_mv = self.b.ref_stack_mv[0][0];
             let searched = self.motion_search(rf, pred_mv);
+            searched_mv.push((rf, searched));
             let bits = 3.0 + mv_bits(searched[0] - pred_mv[0]) + mv_bits(searched[1] - pred_mv[1]);
             cands.push((NEWMV, 0, searched, bits));
             for (mode, idx, mv, bits) in cands {
@@ -384,6 +429,49 @@ impl TileDecoder<'_, '_> {
                 ));
             }
         }
+        // Compound: LAST with each other reference, averaged.
+        if tools.compound
+            && self.f.hdr.reference_select
+            && NUM_4X4_BLOCKS_WIDE[ms].min(NUM_4X4_BLOCKS_HIGH[ms]) >= 2
+        {
+            for &(r2, mv2) in searched_mv.iter().skip(1) {
+                let Some(&(_, mv1)) = searched_mv.first() else {
+                    break;
+                };
+                self.b.ref_frame = [LAST_FRAME, r2];
+                self.b.is_inter = true;
+                self.find_mv_stack(true);
+                let nearest = self.b.ref_stack_mv[0];
+                let global = self.b.global_mvs;
+                for (mode, mvs, bits) in [
+                    (NEAREST_NEARESTMV, nearest, 3.0),
+                    (GLOBAL_GLOBALMV, global, 4.0),
+                    (
+                        NEW_NEWMV,
+                        [mv1, mv2],
+                        6.0 + mv_bits(mv1[0] - nearest[0][0])
+                            + mv_bits(mv1[1] - nearest[0][1])
+                            + mv_bits(mv2[0] - nearest[1][0])
+                            + mv_bits(mv2[1] - nearest[1][1]),
+                    ),
+                ] {
+                    let cost =
+                        self.compound_satd(LAST_FRAME, mvs[0], r2, mvs[1]) as f64 + lambda * bits;
+                    inter.push((
+                        Plan {
+                            is_inter: true,
+                            y_mode: mode,
+                            ref_frame: LAST_FRAME,
+                            ref_frame2: r2,
+                            ref_mv_idx: 0,
+                            mv: mvs,
+                            ..Default::default()
+                        },
+                        cost,
+                    ));
+                }
+            }
+        }
         self.b.is_inter = false;
         self.b.ref_frame = [INTRA_FRAME, NONE];
         inter.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -391,8 +479,7 @@ impl TileDecoder<'_, '_> {
         let best_inter = inter.first().map_or(f64::MAX, |x| x.1);
         let intra_keep = out
             .into_iter()
-            .zip(ys.iter())
-            .filter(|(_, y)| y.1 < best_inter * 1.5)
+            .filter(|(_, score)| *score < best_inter * 1.5)
             .map(|(p, _)| p);
         let mut all: Vec<Plan> = inter
             .iter()
@@ -401,6 +488,157 @@ impl TileDecoder<'_, '_> {
             .collect();
         all.extend(intra_keep);
         all
+    }
+
+    /// A luma palette for this block: its distinct colours when there are
+    /// at most eight, else eight found by k-means; `None` for a flat block
+    /// or one without sharp edges (where a palette does not pay).
+    fn palette_colors(&self) -> Option<(u8, [u16; 8])> {
+        let ms = self.b.mi_size;
+        let (w, h) = (block_width(ms), block_height(ms));
+        let x0 = self.b.mi_col * MI_SIZE;
+        let y0 = self.b.mi_row * MI_SIZE;
+        let e = self.enc();
+        let mut vals: Vec<u16> = Vec::with_capacity(w * h);
+        for i in 0..h {
+            for j in 0..w {
+                vals.push(e.src(0, x0 + j, y0 + i) as u16);
+            }
+        }
+        let mut distinct = vals.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() < 2 {
+            return None;
+        }
+        let shift = self.f.bit_depth - 8;
+        if (distinct[distinct.len() - 1] - distinct[0]) >> shift < 48 {
+            return None;
+        }
+        let mut colors: Vec<u16> = if distinct.len() <= 8 {
+            distinct
+        } else {
+            // k-means, seeded across the range.
+            let k = 8usize;
+            let (lo, hi) = (distinct[0] as f64, distinct[distinct.len() - 1] as f64);
+            let mut c: Vec<f64> = (0..k)
+                .map(|i| lo + (hi - lo) * (i as f64 + 0.5) / k as f64)
+                .collect();
+            for _ in 0..8 {
+                let mut sum = vec![0f64; k];
+                let mut cnt = vec![0usize; k];
+                for &v in &vals {
+                    let i = (0..k)
+                        .min_by(|&a, &b| {
+                            (v as f64 - c[a]).abs().total_cmp(&(v as f64 - c[b]).abs())
+                        })
+                        .unwrap_or(0);
+                    sum[i] += v as f64;
+                    cnt[i] += 1;
+                }
+                for i in 0..k {
+                    if cnt[i] > 0 {
+                        c[i] = sum[i] / cnt[i] as f64;
+                    }
+                }
+            }
+            let mut out: Vec<u16> = c.iter().map(|v| v.round() as u16).collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        colors.truncate(8);
+        if colors.len() < 2 {
+            return None;
+        }
+        let mut arr = [0u16; 8];
+        arr[..colors.len()].copy_from_slice(&colors);
+        Some((colors.len() as u8, arr))
+    }
+
+    /// The palette indices of the block about to be coded: each sample's
+    /// nearest colour (encode mode; into `EncCtx::palette_map`).
+    pub(crate) fn enc_palette_map(&mut self, onscreen_width: usize, onscreen_height: usize) {
+        let n = self.b.palette_size_y;
+        let colors = self.b.palette_colors_y;
+        let x0 = self.b.mi_col * MI_SIZE;
+        let y0 = self.b.mi_row * MI_SIZE;
+        let e = self.enc.as_mut().expect("encode mode");
+        for i in 0..onscreen_height {
+            for j in 0..onscreen_width {
+                let v = e.src[0][(y0 + i) * e.stride[0] + x0 + j] as i32;
+                let mut best = (i32::MAX, 0u8);
+                for (k, &c) in colors.iter().take(n).enumerate() {
+                    let d = (v - c as i32).abs();
+                    if d < best.0 {
+                        best = (d, k as u8);
+                    }
+                }
+                e.palette_map[i][j] = best.1;
+            }
+        }
+    }
+
+    /// The chroma-from-luma alphas for this block, fitted by least squares
+    /// to the source (the luma reconstruction is not there yet), or `None`
+    /// when chroma from luma is not allowed or would be flat.
+    fn cfl_alphas(&self) -> Option<(i32, i32)> {
+        let ms = self.b.mi_size;
+        if !self.b.has_chroma
+            || self.b.lossless
+            || block_width(ms).max(block_height(ms)) > 32
+            || self.f.num_planes < 3
+        {
+            return None;
+        }
+        let (ssx, ssy) = (self.f.ssx, self.f.ssy);
+        let cs = self.f.plane_residual_size(ms, 1);
+        let (w, h) = (block_width(cs), block_height(cs));
+        let x0 = (self.b.mi_col >> ssx) * MI_SIZE;
+        let y0 = (self.b.mi_row >> ssy) * MI_SIZE;
+        let e = self.enc();
+        let mut l = vec![0i64; w * h];
+        let mut sum = 0i64;
+        for i in 0..h {
+            for j in 0..w {
+                let (lx, ly) = ((x0 + j) << ssx, (y0 + i) << ssy);
+                let mut t = 0i64;
+                for dy in 0..=ssy {
+                    for dx in 0..=ssx {
+                        t += e.src(0, lx + dx, ly + dy) as i64;
+                    }
+                }
+                let v = t << (3 - ssx - ssy);
+                l[i * w + j] = v;
+                sum += v;
+            }
+        }
+        let avg = sum / (w * h) as i64;
+        let den: i64 = l.iter().map(|&v| (v - avg) * (v - avg)).sum();
+        if den == 0 {
+            return None;
+        }
+        let mut alphas = [0i32; 2];
+        for (k, plane) in [1usize, 2].into_iter().enumerate() {
+            let mut csum = 0i64;
+            for i in 0..h {
+                for j in 0..w {
+                    csum += e.src(plane, x0 + j, y0 + i) as i64;
+                }
+            }
+            let cavg = csum / (w * h) as i64;
+            let mut num = 0i64;
+            for i in 0..h {
+                for j in 0..w {
+                    num += (e.src(plane, x0 + j, y0 + i) as i64 - cavg) * (l[i * w + j] - avg);
+                }
+            }
+            alphas[k] = ((64 * num) as f64 / den as f64).round().clamp(-16.0, 16.0) as i32;
+        }
+        if alphas == [0, 0] {
+            return None;
+        }
+        Some((alphas[0], alphas[1]))
     }
 
     /// Chooses the block's modes without search (`plan`), before
@@ -683,6 +921,27 @@ impl TileDecoder<'_, '_> {
             }
         }
         satd(&src, &pred, w, h)
+    }
+
+    /// Luma SATD of the average of two single-reference predictions (an
+    /// estimate of the compound prediction, for preselection).
+    fn compound_satd(&self, r1: i32, mv1: Mv, r2: i32, mv2: Mv) -> u64 {
+        let w = block_width(self.b.mi_size);
+        let h = block_height(self.b.mi_size);
+        let x = self.b.mi_col * MI_SIZE;
+        let y = self.b.mi_row * MI_SIZE;
+        let p1 = self.inter_pred(0, x, y, w, h, r1, mv1);
+        let p2 = self.inter_pred(0, x, y, w, h, r2, mv2);
+        let e = self.enc();
+        let mut src = vec![0i32; w * h];
+        let mut avg = vec![0i32; w * h];
+        for i in 0..h {
+            for j in 0..w {
+                src[i * w + j] = e.src(0, x + j, y + i);
+                avg[i * w + j] = (p1[i * w + j] + p2[i * w + j] + 1) >> 1;
+            }
+        }
+        satd(&src, &avg, w, h)
     }
 
     /// A full-pel search around the predicted and zero vectors, then

@@ -430,11 +430,29 @@ impl Coder<'_> {
         }
     }
 
-    /// A non-symmetric value the encoder never codes.
+    /// `NS(n)` when decoding; codes `v` when encoding.
     pub(crate) fn read_ns(&mut self, n: u32) -> u32 {
+        self.ns(n, 0)
+    }
+
+    /// `NS(n)` when decoding; codes `v` (below `n`) when encoding.
+    pub(crate) fn ns(&mut self, n: u32, v: u32) -> u32 {
         match self {
             Coder::Dec(d) => d.read_ns(n),
-            Coder::Enc(_) => panic!("the encoder does not code this value"),
+            Coder::Enc(e) => {
+                if n > 1 {
+                    let w = floor_log2(n) + 1;
+                    let m = (1 << w) - n;
+                    if v < m {
+                        e.write_literal(w - 1, v);
+                    } else {
+                        let t = v + m;
+                        e.write_literal(w - 1, t >> 1);
+                        e.write_literal(1, t & 1);
+                    }
+                }
+                v
+            }
         }
     }
 

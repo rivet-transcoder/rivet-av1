@@ -106,6 +106,14 @@ pub(crate) struct Plan {
     /// `tx_depth` (intra) or the uniform variable-transform depth (inter)
     /// under `TX_MODE_SELECT`.
     pub(crate) tx_depth: u8,
+    /// `CflAlphaU`, `CflAlphaV` (chroma from luma).
+    pub(crate) cfl_alpha_u: i32,
+    pub(crate) cfl_alpha_v: i32,
+    /// The second reference of a compound block (`INTRA_FRAME`: none).
+    pub(crate) ref_frame2: i32,
+    /// A luma palette: its size (0: none) and colours, ascending.
+    pub(crate) palette_n: u8,
+    pub(crate) palette_colors: [u16; 8],
 }
 
 /// The decoder of one tile: the symbol decoder, the tile's CDFs, the
@@ -342,22 +350,32 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     fn read_lr_unit(&mut self, plane: usize, unit_row: usize, unit_col: usize) {
         let frt = self.f.hdr.frame_restoration_type[plane];
+        let idx = unit_row * self.f.lr[plane].unit_cols + unit_col;
+        // The encoder's choice for the unit (encode mode).
+        let planned = self
+            .enc
+            .as_ref()
+            .and_then(|e| e.lr_plan.as_ref())
+            .and_then(|p| p.units[plane].get(idx).copied())
+            .unwrap_or_default();
         let restoration_type = if frt == RESTORE_WIENER {
-            if self.sd.read_symbol(&mut self.cdf.use_wiener) != 0 {
+            let p = (planned.t == RESTORE_WIENER) as usize;
+            if self.sd.symbol(&mut self.cdf.use_wiener, p) != 0 {
                 RESTORE_WIENER
             } else {
                 RESTORE_NONE
             }
         } else if frt == RESTORE_SGRPROJ {
-            if self.sd.read_symbol(&mut self.cdf.use_sgrproj) != 0 {
+            let p = (planned.t == RESTORE_SGRPROJ) as usize;
+            if self.sd.symbol(&mut self.cdf.use_sgrproj, p) != 0 {
                 RESTORE_SGRPROJ
             } else {
                 RESTORE_NONE
             }
         } else {
-            self.sd.read_symbol(&mut self.cdf.restoration_type) as u8
+            self.sd
+                .symbol(&mut self.cdf.restoration_type, planned.t as usize) as u8
         };
-        let idx = unit_row * self.f.lr[plane].unit_cols + unit_col;
         self.f.lr[plane].lr_type[idx] = restoration_type;
         if restoration_type == RESTORE_WIENER {
             for pass in 0..2 {
@@ -376,13 +394,14 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                         max + 1,
                         k,
                         self.ref_lr_wiener[plane][pass][j],
+                        planned.wiener[pass][j],
                     );
                     self.f.lr[plane].wiener[idx][pass][j] = v;
                     self.ref_lr_wiener[plane][pass][j] = v;
                 }
             }
         } else if restoration_type == RESTORE_SGRPROJ {
-            let set = self.sd.read_literal(SGRPROJ_PARAMS_BITS) as usize;
+            let set = self.sd.literal(SGRPROJ_PARAMS_BITS, planned.set as u32) as usize;
             self.f.lr[plane].sgr_set[idx] = set as u8;
             for i in 0..2 {
                 let radius = SGR_PARAMS[set][i * 2];
@@ -394,6 +413,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                         max + 1,
                         SGRPROJ_PRJ_SUBEXP_K,
                         self.ref_sgr_xqd[plane][i],
+                        planned.xqd[i],
                     )
                 } else if i == 1 {
                     clip3(
@@ -410,13 +430,44 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         }
     }
 
-    fn decode_signed_subexp_with_ref_bool(&mut self, low: i32, high: i32, k: u32, r: i32) -> i32 {
-        let x = self.decode_unsigned_subexp_with_ref_bool(high - low, k, r - low);
+    /// `decode_signed_subexp_with_ref_bool( low, high, k, r )`; codes
+    /// `planned` when encoding.
+    fn decode_signed_subexp_with_ref_bool(
+        &mut self,
+        low: i32,
+        high: i32,
+        k: u32,
+        r: i32,
+        planned: i32,
+    ) -> i32 {
+        let x = self.decode_unsigned_subexp_with_ref_bool(high - low, k, r - low, planned - low);
         x + low
     }
 
-    fn decode_unsigned_subexp_with_ref_bool(&mut self, mx: i32, k: u32, r: i32) -> i32 {
-        let v = self.decode_subexp_bool(mx, k);
+    fn decode_unsigned_subexp_with_ref_bool(
+        &mut self,
+        mx: i32,
+        k: u32,
+        r: i32,
+        planned: i32,
+    ) -> i32 {
+        // The planned value's position in the recentred order (encode
+        // mode): the inverse of inverse_recenter().
+        let recenter = |r: i32, x: i32| {
+            if x > 2 * r {
+                x
+            } else if x >= r {
+                2 * (x - r)
+            } else {
+                2 * (r - x) - 1
+            }
+        };
+        let pv = if (r << 1) <= mx {
+            recenter(r, planned)
+        } else {
+            recenter(mx - 1 - r, mx - 1 - planned)
+        };
+        let v = self.decode_subexp_bool(mx, k, pv);
         if (r << 1) <= mx {
             crate::header::inverse_recenter(r, v)
         } else {
@@ -424,19 +475,23 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         }
     }
 
-    fn decode_subexp_bool(&mut self, num_syms: i32, k: u32) -> i32 {
+    fn decode_subexp_bool(&mut self, num_syms: i32, k: u32, planned: i32) -> i32 {
         let mut i = 0u32;
         let mut mk = 0i32;
         loop {
             let b2 = if i != 0 { k + i - 1 } else { k };
             let a = 1i32 << b2;
             if num_syms <= mk + 3 * a {
-                return self.sd.read_ns((num_syms - mk) as u32) as i32 + mk;
-            } else if self.sd.read_literal(1) != 0 {
+                return self
+                    .sd
+                    .ns((num_syms - mk) as u32, (planned - mk).max(0) as u32)
+                    as i32
+                    + mk;
+            } else if self.sd.literal(1, (planned >= mk + a) as u32) != 0 {
                 i += 1;
                 mk += a;
             } else {
-                return self.sd.read_literal(b2) as i32 + mk;
+                return self.sd.literal(b2, (planned - mk).max(0) as u32) as i32 + mk;
             }
         }
     }
@@ -1049,19 +1104,30 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
     }
 
     fn read_cfl_alphas(&mut self) {
-        let signs = self.sd.read_symbol(&mut self.cdf.cfl_sign) as u32;
+        // The planned alphas (encode mode): their signs, jointly, then
+        // their magnitudes.
+        let sign_of = |a: i32| match a.signum() {
+            0 => CFL_SIGN_ZERO,
+            -1 => CFL_SIGN_NEG,
+            _ => CFL_SIGN_POS,
+        };
+        let (pu, pv) = (self.plan.cfl_alpha_u, self.plan.cfl_alpha_v);
+        let planned_signs = (sign_of(pu) * 3 + sign_of(pv)).saturating_sub(1) as usize;
+        let signs = self.sd.symbol(&mut self.cdf.cfl_sign, planned_signs) as u32;
         let sign_u = (signs + 1) / 3;
         let sign_v = (signs + 1) % 3;
         if sign_u != CFL_SIGN_ZERO {
             let ctx = ((sign_u - 1) * 3 + sign_v) as usize;
-            let a = self.sd.read_symbol(&mut self.cdf.cfl_alpha[ctx]) as i32 + 1;
+            let p = (pu.unsigned_abs().max(1) - 1) as usize;
+            let a = self.sd.symbol(&mut self.cdf.cfl_alpha[ctx], p) as i32 + 1;
             self.b.cfl_alpha_u = if sign_u == CFL_SIGN_NEG { -a } else { a };
         } else {
             self.b.cfl_alpha_u = 0;
         }
         if sign_v != CFL_SIGN_ZERO {
             let ctx = ((sign_v - 1) * 3 + sign_u) as usize;
-            let a = self.sd.read_symbol(&mut self.cdf.cfl_alpha[ctx]) as i32 + 1;
+            let p = (pv.unsigned_abs().max(1) - 1) as usize;
+            let a = self.sd.symbol(&mut self.cdf.cfl_alpha[ctx], p) as i32 + 1;
             self.b.cfl_alpha_v = if sign_v == CFL_SIGN_NEG { -a } else { a };
         } else {
             self.b.cfl_alpha_v = 0;
@@ -1095,35 +1161,51 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             if self.b.avail_l && self.mi(self.b.mi_row, self.b.mi_col - 1).palette_size[0] > 0 {
                 ctx += 1;
             }
-            let has_palette_y = self
-                .sd
-                .read_symbol(&mut self.cdf.palette_y_mode[bsize_ctx][ctx])
-                != 0;
+            // The encoder's palette (encode mode): coded without the cache,
+            // the first colour then the differences.
+            let pn = self.plan.palette_n as usize;
+            let pc = self.plan.palette_colors;
+            let has_palette_y = self.sd.symbol(
+                &mut self.cdf.palette_y_mode[bsize_ctx][ctx],
+                (pn >= 2) as usize,
+            ) != 0;
             if has_palette_y {
-                let n = self.sd.read_symbol(&mut self.cdf.palette_y_size[bsize_ctx]) + 2;
+                let n = self.sd.symbol(
+                    &mut self.cdf.palette_y_size[bsize_ctx],
+                    pn.saturating_sub(2),
+                ) + 2;
                 self.b.palette_size_y = n;
                 let cache = self.get_palette_cache(0);
                 let mut colors = [0u16; 8];
                 let mut idx = 0;
                 let mut i = 0;
                 while i < cache.len() && idx < n {
-                    if self.sd.read_literal(1) != 0 {
+                    if self.sd.literal(1, 0) != 0 {
                         colors[idx] = cache[i];
                         idx += 1;
                     }
                     i += 1;
                 }
                 if idx < n {
-                    colors[idx] = self.sd.read_literal(bit_depth) as u16;
+                    colors[idx] = self.sd.literal(bit_depth, pc[0] as u32) as u16;
                     idx += 1;
                 }
                 let mut palette_bits = 0;
                 if idx < n {
                     let min_bits = bit_depth - 3;
-                    palette_bits = min_bits + self.sd.read_literal(2);
+                    let need = (1..pn.max(1))
+                        .map(|k| crate::bits::ceil_log2((pc[k] - pc[k - 1]) as u32))
+                        .max()
+                        .unwrap_or(0);
+                    let extra = need.saturating_sub(min_bits).min(3);
+                    palette_bits = min_bits + self.sd.literal(2, extra);
                 }
                 while idx < n {
-                    let delta = self.sd.read_literal(palette_bits) as i32 + 1;
+                    let planned = (pc[idx.min(7)] as i32
+                        - pc[idx.saturating_sub(1).min(7)] as i32
+                        - 1)
+                    .max(0) as u32;
+                    let delta = self.sd.literal(palette_bits, planned) as i32 + 1;
                     let v = (colors[idx - 1] as i32 + delta).min((1 << bit_depth) - 1);
                     colors[idx] = v as u16;
                     let range = (1i32 << bit_depth) - v - 1;
@@ -1136,7 +1218,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         }
         if self.b.has_chroma && self.b.uv_mode == DC_PRED {
             let ctx = (self.b.palette_size_y > 0) as usize;
-            let has_palette_uv = self.sd.read_symbol(&mut self.cdf.palette_uv_mode[ctx]) != 0;
+            let has_palette_uv = self.sd.symbol(&mut self.cdf.palette_uv_mode[ctx], 0) != 0;
             if has_palette_uv {
                 let n = self
                     .sd
@@ -1271,7 +1353,11 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let mut onscreen_width = block_width.min((self.f.mi_cols - self.b.mi_col) * MI_SIZE);
         if self.b.palette_size_y > 0 {
             let n = self.b.palette_size_y;
-            let v = self.sd.read_ns(n as u32) as u8;
+            if self.sd.encoding() {
+                self.enc_palette_map(onscreen_width, onscreen_height);
+            }
+            let p0 = self.enc.as_ref().map_or(0, |e| e.palette_map[0][0]) as u32;
+            let v = self.sd.ns(n as u32, p0) as u8;
             self.color_map_y[0][0] = v;
             self.read_color_map(
                 true,
@@ -1338,7 +1424,17 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 } else {
                     &mut self.cdf.palette_uv_color
                 };
-                let s = self.sd.read_symbol(palette_color_cdf(rows, n, ctx));
+                // The planned index's position in the context's order
+                // (encode mode).
+                let planned = if luma {
+                    self.enc.as_ref().map_or(0, |e| {
+                        let want = e.palette_map[i - ju][ju];
+                        order.iter().position(|&o| o == want).unwrap_or(0)
+                    })
+                } else {
+                    0
+                };
+                let s = self.sd.symbol(palette_color_cdf(rows, n, ctx), planned);
                 let map = if luma {
                     &mut self.color_map_y
                 } else {
@@ -1697,8 +1793,8 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         } else if is_compound {
             let ctx = COMPOUND_MODE_CTX_MAP[self.b.ref_mv_context >> 1]
                 [self.b.new_mv_context.min(COMP_NEWMV_CTXS - 1)];
-            self.b.y_mode =
-                NEAREST_NEARESTMV + self.sd.read_symbol(&mut self.cdf.compound_mode[ctx]);
+            let p = self.plan.y_mode.saturating_sub(NEAREST_NEARESTMV);
+            self.b.y_mode = NEAREST_NEARESTMV + self.sd.symbol(&mut self.cdf.compound_mode[ctx], p);
         } else {
             let py = self.plan.y_mode;
             let new_mv = self.sd.symbol(
@@ -1871,7 +1967,8 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let bh4 = NUM_4X4_BLOCKS_HIGH[ms];
         let comp_mode = if self.f.hdr.reference_select && bw4.min(bh4) >= 2 {
             let ctx = self.comp_mode_ctx();
-            self.sd.read_symbol(&mut self.cdf.comp_mode[ctx])
+            let p = (self.plan.ref_frame2 > INTRA_FRAME) as usize;
+            self.sd.symbol(&mut self.cdf.comp_mode[ctx], p)
         } else {
             0
         };
@@ -1886,20 +1983,30 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let ctx_comp_bwdref_p1 = self.ref_ctx(&[BWDREF_FRAME], &[ALTREF2_FRAME]);
         if comp_mode == 1 {
             let ctx = self.comp_ref_type_ctx();
-            let comp_ref_type = self.sd.read_symbol(&mut self.cdf.comp_ref_type[ctx]) as u32;
+            // The encoder plans unidirectional pairs: LAST with LAST2 or
+            // with GOLDEN.
+            let r2 = self.plan.ref_frame2;
+            let comp_ref_type = self.sd.symbol(
+                &mut self.cdf.comp_ref_type[ctx],
+                UNIDIR_COMP_REFERENCE as usize,
+            ) as u32;
             if comp_ref_type == UNIDIR_COMP_REFERENCE {
                 let uni = self
                     .sd
-                    .read_symbol(&mut self.cdf.uni_comp_ref[ctx_single_p1][0]);
+                    .symbol(&mut self.cdf.uni_comp_ref[ctx_single_p1][0], 0);
                 if uni != 0 {
                     self.b.ref_frame = [BWDREF_FRAME, ALTREF_FRAME];
                 } else {
                     let ctx1 = self.ref_ctx(&[LAST2_FRAME], &[LAST3_FRAME, GOLDEN_FRAME]);
-                    let p1 = self.sd.read_symbol(&mut self.cdf.uni_comp_ref[ctx1][1]);
+                    let p1 = self.sd.symbol(
+                        &mut self.cdf.uni_comp_ref[ctx1][1],
+                        (r2 != LAST2_FRAME) as usize,
+                    );
                     if p1 != 0 {
-                        let p2 = self
-                            .sd
-                            .read_symbol(&mut self.cdf.uni_comp_ref[ctx_comp_ref_p2][2]);
+                        let p2 = self.sd.symbol(
+                            &mut self.cdf.uni_comp_ref[ctx_comp_ref_p2][2],
+                            (r2 == GOLDEN_FRAME) as usize,
+                        );
                         self.b.ref_frame = if p2 != 0 {
                             [LAST_FRAME, GOLDEN_FRAME]
                         } else {

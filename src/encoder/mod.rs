@@ -16,6 +16,7 @@
 
 pub(crate) mod cdef;
 pub(crate) mod fwd;
+pub(crate) mod lr;
 pub(crate) mod rdo;
 pub(crate) mod tile;
 
@@ -93,6 +94,9 @@ pub struct Tools {
     pub partition_4x4: bool,
     /// Leave a block that codes flat (no residual) unsplit.
     pub prune_split: bool,
+    /// Try the split first, and the block whole (or halved) only when
+    /// the split's sub-blocks stayed whole.
+    pub prune_partition: bool,
     /// Try skipping the residual of inter blocks.
     pub rd_skip: bool,
     /// `TX_MODE_SELECT`: transform sizes below the block size, searched.
@@ -119,6 +123,19 @@ pub struct Tools {
     /// Several references: the last two frames and a golden frame (the
     /// key frame, then every 16th frame, coded finer).
     pub multi_ref: bool,
+    /// Chroma from luma: a candidate for intra blocks up to 32x32.
+    pub cfl: bool,
+    /// Loop restoration: a Wiener or self-guided filter per unit, fitted
+    /// to the source on the first pass's reconstruction.
+    pub restoration: bool,
+    /// The restoration search tries every self-guided parameter set.
+    pub restoration_thorough: bool,
+    /// Compound prediction: the average of LAST and a second reference
+    /// (needs `multi_ref`).
+    pub compound: bool,
+    /// Palettes (screen content tools) on frames that look like screen
+    /// content: few colours, sharp edges.
+    pub palette: bool,
 }
 
 impl Tools {
@@ -128,15 +145,16 @@ impl Tools {
         Tools {
             rdo: s <= 8,
             partition_rect: s <= 5,
-            partition_4x4: s <= 2,
+            partition_4x4: s <= 1,
             prune_split: s >= 3,
-            rd_skip: s <= 6,
+            prune_partition: s >= 5,
+            rd_skip: s <= 7,
             tx_size: s <= 6,
             tx_type_rd: s <= 8,
             tx_types: match s {
                 0..=1 => 16,
                 2..=3 => 7,
-                4..=5 => 5,
+                4..=6 => 5,
                 _ => 4,
             },
             full_tx_set: s <= 3,
@@ -152,10 +170,15 @@ impl Tools {
                 5..=6 => 2,
                 _ => 1,
             },
-            cdef: s <= 8,
+            cdef: s <= 9,
             cdef_thorough: s <= 3,
-            lf_search: s <= 8,
+            lf_search: s <= 9,
             multi_ref: s <= 6,
+            cfl: s <= 7,
+            restoration: s <= 6,
+            restoration_thorough: s <= 2,
+            compound: s <= 5,
+            palette: s <= 8,
         }
     }
 
@@ -168,6 +191,7 @@ impl Tools {
             "partition_rect" => self.partition_rect = b,
             "partition_4x4" => self.partition_4x4 = b,
             "prune_split" => self.prune_split = b,
+            "prune_partition" => self.prune_partition = b,
             "rd_skip" => self.rd_skip = b,
             "tx_size" => self.tx_size = b,
             "tx_type_rd" => self.tx_type_rd = b,
@@ -179,6 +203,11 @@ impl Tools {
             "cdef_thorough" => self.cdef_thorough = b,
             "lf_search" => self.lf_search = b,
             "multi_ref" => self.multi_ref = b,
+            "cfl" => self.cfl = b,
+            "restoration" => self.restoration = b,
+            "restoration_thorough" => self.restoration_thorough = b,
+            "compound" => self.compound = b,
+            "palette" => self.palette = b,
             _ => return false,
         }
         true
@@ -229,6 +258,8 @@ pub struct Encoder {
     /// The slots of `LAST_FRAME` and `LAST2_FRAME`.
     last_slot: usize,
     last2_slot: usize,
+    /// The frame being encoded looks like screen content.
+    next_screen_content: bool,
 }
 
 /// The slot the golden frame (the key frame, or a periodic boosted frame)
@@ -248,6 +279,12 @@ struct FrameParams {
     /// `loop_filter_level[ 0..4 ]`.
     lf: [u32; 4],
     cdef: Option<cdef::CdefParams>,
+    /// `FrameRestorationType` per plane, when restoration is on.
+    lr: Option<[u8; 3]>,
+    /// `reference_select`: compound prediction allowed.
+    reference_select: bool,
+    /// `allow_screen_content_tools` (palettes).
+    screen_content: bool,
     tx_select: bool,
     reduced_tx_set: bool,
     tile_cols_log2: u32,
@@ -259,6 +296,8 @@ struct Replay {
     logs: Vec<Vec<rdo::Decision>>,
     /// Each 64x64 block's CDEF index.
     cdef: Option<Vec<i8>>,
+    /// Each restoration unit's parameters.
+    lr: Option<Arc<lr::LrPlan>>,
 }
 
 /// The coded frame: its state for the in-loop filters, and its tiles.
@@ -306,12 +345,18 @@ impl Encoder {
             enable_order_hint: true,
             enable_jnt_comp: false,
             enable_ref_frame_mvs: false,
-            seq_force_screen_content_tools: 0,
+            // Screen content tools chosen per frame when palettes may be
+            // used.
+            seq_force_screen_content_tools: if cfg.tools.palette {
+                SELECT_SCREEN_CONTENT_TOOLS
+            } else {
+                0
+            },
             seq_force_integer_mv: SELECT_INTEGER_MV,
             order_hint_bits: 7,
             enable_superres: false,
             enable_cdef: cfg.tools.cdef,
-            enable_restoration: false,
+            enable_restoration: cfg.tools.restoration,
             color: ColorConfig {
                 bit_depth: cfg.bit_depth,
                 mono_chrome: false,
@@ -346,6 +391,7 @@ impl Encoder {
             slot_frame: [0; NUM_REF_FRAMES],
             last_slot: 0,
             last2_slot: 1,
+            next_screen_content: false,
         }
     }
 
@@ -402,6 +448,9 @@ impl Encoder {
         }
         check_color(&cfg.color)?;
         let key = self.next_is_keyframe();
+        if self.cfg.tools.palette {
+            self.next_screen_content = looks_like_screen_content(frame);
+        }
         let mut p = self.frame_params(key);
         let seq = self.seq.clone();
         if self.dec.seq.is_none() || key {
@@ -411,7 +460,7 @@ impl Encoder {
         let src = Arc::new(src);
         let tools = self.cfg.tools;
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
-        if tools.lf_search || tools.cdef {
+        if tools.lf_search || tools.cdef || tools.restoration {
             // The in-loop filters' parameters, chosen on the first pass's
             // reconstruction; then the frame again with them, replaying the
             // first pass's decisions.
@@ -424,15 +473,43 @@ impl Encoder {
                 crate::decoder::postfilter::loop_filter_threads(&mut f, self.cfg.threads.max(1));
             }
             let mut cdef_table = None;
+            let lambda = rd_lambda(&self.cfg, p.qidx);
             if tools.cdef {
-                let lambda = rd_lambda(&self.cfg, p.qidx);
                 let (params, table) = cdef::search(&f, &src, &stride, lambda, tools.cdef_thorough);
+                // The chosen CDEF, as the decoder will apply it.
+                let h = &mut f.hdr;
+                h.cdef_damping = params.damping_minus_3 as i32 + 3;
+                h.cdef_bits = params.bits;
+                for (i, (&(yp, ys), &(up, us))) in params.y.iter().zip(&params.uv).enumerate() {
+                    let sec = |s: u32| if s == 3 { 4 } else { s as i32 };
+                    h.cdef_y_pri_strength[i] = yp as i32;
+                    h.cdef_y_sec_strength[i] = sec(ys);
+                    h.cdef_uv_pri_strength[i] = up as i32;
+                    h.cdef_uv_sec_strength[i] = sec(us);
+                }
+                f.cdef_idx.copy_from_slice(&table);
                 p.cdef = Some(params);
                 cdef_table = Some(table);
+            }
+            let mut lr_plan = None;
+            if tools.restoration {
+                let cdef_frame = crate::decoder::postfilter::cdef(&f, self.cfg.threads.max(1));
+                let plan = lr::search(
+                    &f,
+                    &f.cur,
+                    &cdef_frame,
+                    &src,
+                    &stride,
+                    lambda,
+                    tools.restoration_thorough,
+                );
+                p.lr = Some(plan.frame_type);
+                lr_plan = Some(Arc::new(plan));
             }
             let replay = Replay {
                 logs: std::mem::take(&mut coded.logs),
                 cdef: cdef_table,
+                lr: lr_plan,
             };
             coded = self.code_frame(&p, &src, &stride, Some(replay))?;
         }
@@ -539,6 +616,8 @@ impl Encoder {
             .loop_filter
             .unwrap_or_else(|| ((qidx as f64) * 0.18 + 2.0).min(40.0) as u32);
         let chroma_lf = if lf != 0 { lf / 2 + 1 } else { 0 };
+        let reference_select = !key && tools.compound && tools.multi_ref && search_refs.len() > 1;
+        let screen_content = tools.palette && self.next_screen_content;
         FrameParams {
             key,
             qidx,
@@ -551,6 +630,15 @@ impl Encoder {
             } else {
                 None
             },
+            // Switchable in every plane on the first pass, every unit off:
+            // the units exist for the search.
+            lr: if tools.restoration {
+                Some([RESTORE_SWITCHABLE; 3])
+            } else {
+                None
+            },
+            reference_select,
+            screen_content,
             tx_select: tools.tx_size && tools.rdo,
             reduced_tx_set: !(tools.full_tx_set && tools.rdo),
             tile_cols_log2: self.cfg.tile_cols_log2,
@@ -612,6 +700,7 @@ impl Encoder {
             if let Some(rp) = replay.as_mut() {
                 enc.rdo.replay = std::mem::take(&mut rp.logs[t]).into();
                 enc.cdef_table = rp.cdef.clone();
+                enc.lr_plan = rp.lr.clone();
             }
             jobs.push(std::sync::Mutex::new(Some(enc)));
         }
@@ -698,6 +787,8 @@ impl Encoder {
             res: Vec::new(),
             fc: Vec::new(),
             cdef_table: None,
+            lr_plan: None,
+            palette_map: Box::new([[0; 64]; 64]),
         })
     }
 
@@ -713,7 +804,12 @@ impl Encoder {
             w.flag(false); // error_resilient_mode
         }
         w.flag(false); // disable_cdf_update
-        // allow_screen_content_tools: seq_force_screen_content_tools = 0.
+        if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
+            w.flag(p.screen_content); // allow_screen_content_tools
+            if p.screen_content {
+                w.flag(false); // force_integer_mv
+            }
+        }
         w.flag(false); // frame_size_override_flag
         w.f(
             seq.order_hint_bits,
@@ -735,6 +831,9 @@ impl Encoder {
             w.flag(false); // is_motion_mode_switchable
         } else {
             w.flag(false); // render_and_frame_size_different
+            if p.screen_content {
+                w.flag(false); // allow_intrabc
+            }
         }
         w.flag(false); // disable_frame_end_update_cdf
         // tile_info(): uniform spacing, the tile columns asked for (at
@@ -792,11 +891,45 @@ impl Encoder {
                 w.f(2, c.uv[i].1);
             }
         }
+        // lr_params()
+        if let Some(types) = &p.lr {
+            let mut uses_lr = false;
+            let mut uses_chroma_lr = false;
+            for (plane, &t) in types.iter().enumerate() {
+                // The coded lr_type (the inverse of Remap_Lr_Type).
+                w.f(
+                    2,
+                    match t {
+                        RESTORE_NONE => 0,
+                        RESTORE_SWITCHABLE => 1,
+                        RESTORE_WIENER => 2,
+                        _ => 3,
+                    },
+                );
+                if t != RESTORE_NONE {
+                    uses_lr = true;
+                    uses_chroma_lr |= plane > 0;
+                }
+            }
+            if uses_lr {
+                // Units of 64 samples, 128 above 720p.
+                let big = self.cfg.width as u64 * self.cfg.height as u64 > 1280 * 720;
+                w.flag(big); // lr_unit_shift
+                if big {
+                    w.flag(false); // lr_unit_extra_shift
+                }
+                if uses_chroma_lr {
+                    w.flag(false); // lr_uv_shift
+                }
+            }
+        }
         // read_tx_mode(): TX_MODE_SELECT when transform sizes are searched.
         w.flag(p.tx_select);
         if !key {
-            w.flag(false); // reference_select
-            // skip_mode not allowed without reference_select.
+            w.flag(p.reference_select); // reference_select
+            if p.reference_select && self.skip_mode_allowed(p) {
+                w.flag(false); // skip_mode_present
+            }
         }
         w.flag(p.reduced_tx_set); // reduced_tx_set
         if !key {
@@ -807,6 +940,66 @@ impl Encoder {
         w.byte_align();
         w.finish()
     }
+}
+
+impl Encoder {
+    /// Whether the header of `p` lets a frame signal skip mode
+    /// (`skipModeAllowed`, 5.9.22): a forward reference and either a
+    /// backward one or a second, older forward one.
+    fn skip_mode_allowed(&self, p: &FrameParams) -> bool {
+        let seq = &self.seq;
+        let hint = (self.frame_num & ((1 << seq.order_hint_bits) - 1)) as u32;
+        let dist = |a: u32, b: u32| crate::header::get_relative_dist(seq, a, b);
+        let hints: Vec<u32> = p
+            .ref_slots
+            .iter()
+            .map(|&s| self.dec.ref_state.order_hint[s])
+            .collect();
+        let mut forward: Option<u32> = None;
+        let mut backward = false;
+        for &h in &hints {
+            if dist(h, hint) < 0 {
+                if forward.is_none_or(|f| dist(h, f) > 0) {
+                    forward = Some(h);
+                }
+            } else if dist(h, hint) > 0 {
+                backward = true;
+            }
+        }
+        let Some(fwd) = forward else {
+            return false;
+        };
+        backward || hints.iter().any(|&h| dist(h, fwd) < 0)
+    }
+}
+
+/// Whether a frame looks like screen content: a good share of its 16x16
+/// blocks have at most eight distinct luma values and sharp edges.
+fn looks_like_screen_content(frame: &Frame) -> bool {
+    let pl = frame.planes[0];
+    let (w, h) = (pl.width, pl.height);
+    let shift = frame.bit_depth - 8;
+    let mut blocks = 0u32;
+    let mut screen = 0u32;
+    let mut vals = Vec::with_capacity(256);
+    for by in (0..h.saturating_sub(15)).step_by(32) {
+        for bx in (0..w.saturating_sub(15)).step_by(32) {
+            vals.clear();
+            for y in by..by + 16 {
+                for x in bx..bx + 16 {
+                    vals.push(frame.sample(0, x, y));
+                }
+            }
+            vals.sort_unstable();
+            let range = (vals[vals.len() - 1] - vals[0]) >> shift;
+            vals.dedup();
+            blocks += 1;
+            if vals.len() <= 8 && range >= 48 {
+                screen += 1;
+            }
+        }
+    }
+    blocks > 0 && screen * 10 >= blocks
 }
 
 /// How often a boosted golden frame is coded with several references.
