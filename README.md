@@ -36,7 +36,7 @@ Everything in the specification's general decoding process:
 | | |
 |---|---|
 | **Profiles** | 0, 1 and 2 (Main, High, Professional): 8-, 10- and 12-bit; monochrome, 4:2:0, 4:2:2 and 4:4:4; every colour description |
-| **Bitstream** | OBUs in the low-overhead format (section 5) and the length-delimited format of Annex B; sequence headers, temporal delimiters, frame headers and redundant copies, tile groups, frame OBUs; metadata and padding OBUs skipped; operating point selection and layer dropping (scalable streams); frame ids |
+| **Bitstream** | OBUs in the low-overhead format (section 5) and the length-delimited format of Annex B; sequence headers, temporal delimiters, frame headers and redundant copies, tile groups, frame OBUs; HDR metadata OBUs (content light level, mastering display) reported on every frame, other metadata and padding skipped; operating point selection and layer dropping (scalable streams); frame ids |
 | **Frames** | key, inter, intra-only and switch frames; hidden frames and `show_existing_frame` (including key frames shown that way); error-resilient mode; frame size changes, `frame_size_with_refs`, render sizes; reference frame scaling (2:1 down to 1:16) |
 | **Syntax** | uniform and explicit tiles (any count), the symbol decoder with CDF adaptation, saving and loading CDFs through the reference slots, `disable_cdf_update` / `disable_frame_end_update_cdf`; segmentation (map, temporal prediction, every feature); delta quantiser and delta loop filter (single and multi); quantiser matrices; lossless |
 | **Partitions** | every partition (none, horizontal, vertical, split, the A/B three-way splits, 4-way) from 128x128 superblocks down to 4x4; transform sizes 4x4 to 64x64 including all rectangular sizes, `TX_MODE_SELECT` and inter transform trees |
@@ -98,6 +98,17 @@ size from 1x1 up to 4096 wide:
   (`Config::target_bits_per_frame`): the quantiser moves with the log of
   the ratio of the bits a frame took to its target.
 - **Loop filter** at a level derived from the quantiser (or set).
+- **Colour and HDR signalling**: `Config::color` is written into the
+  sequence header's `color_config()` (primaries, transfer, matrix, range,
+  chroma sample position; `color_description_present_flag` when any code
+  point is specified), and `Config::hdr` as `METADATA_TYPE_HDR_CLL` and
+  `METADATA_TYPE_HDR_MDCV` metadata OBUs after the sequence header of every
+  key frame — 10-bit PQ (HDR10) and HLG. The decoder reports both on every
+  `Frame` (`color`, `hdr`) and through `Decoder::color_info` /
+  `Decoder::hdr_metadata`.
+- **Key frames on demand**: `Encoder::force_keyframe()` makes the next frame
+  a key frame (with its sequence header, so a decoder can start there)
+  without resetting the encoder; the interval restarts from it.
 - The arithmetic encoder is the exact inverse of the decoder's symbol
   decoder (derived from 8.2.6).
 

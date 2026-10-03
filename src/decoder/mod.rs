@@ -20,9 +20,9 @@ use std::sync::Arc;
 use crate::bits::BitReader;
 use crate::cdf::CdfContext;
 use crate::consts::*;
-use crate::frame::{ChromaFormat, ColorInfo, Frame};
+use crate::frame::{ChromaFormat, ColorInfo, Frame, HdrMetadata};
 use crate::header::{FrameHeader, RefHeaderState, RefState, get_relative_dist};
-use crate::obu::{SequenceHeader, split_obus};
+use crate::obu::{Metadata, SequenceHeader, split_obus};
 use crate::tables::*;
 use crate::{Error, Result};
 use state::{FrameBuf, Mi, Mv, PlaneBuf, RefData};
@@ -116,6 +116,8 @@ pub struct Decoder {
     strict: bool,
     operating_point: usize,
     max_pixels: u64,
+    /// The HDR metadata OBUs seen so far in this coded video sequence.
+    hdr: HdrMetadata,
 }
 
 impl Default for Decoder {
@@ -137,6 +139,7 @@ impl Decoder {
             strict: false,
             operating_point: 0,
             max_pixels: 1 << 26,
+            hdr: HdrMetadata::default(),
         }
     }
 
@@ -159,6 +162,19 @@ impl Decoder {
     /// one the stream lists first (normally all layers).
     pub fn set_operating_point(&mut self, op: usize) {
         self.operating_point = op;
+    }
+
+    /// The colour description of the sequence header in force, once one
+    /// has been seen.
+    pub fn color_info(&self) -> Option<ColorInfo> {
+        self.seq.as_deref().map(|s| color_info(&s.color))
+    }
+
+    /// The HDR metadata (content light level, mastering display) the
+    /// stream has carried so far in the current coded video sequence;
+    /// every shown [`Frame`] also carries it.
+    pub fn hdr_metadata(&self) -> HdrMetadata {
+        self.hdr
     }
 
     /// Decodes a temporal unit in the length-delimited format of Annex B
@@ -243,6 +259,11 @@ impl Decoder {
         match obu_type {
             OBU_SEQUENCE_HEADER => {
                 let s = SequenceHeader::parse(payload, self.operating_point)?;
+                if self.seq.as_deref() != Some(&s) {
+                    // A new sequence: metadata of the old one no longer
+                    // applies.
+                    self.hdr = HdrMetadata::default();
+                }
                 self.seq = Some(Arc::new(s));
             }
             OBU_TEMPORAL_DELIMITER => {
@@ -282,6 +303,11 @@ impl Decoder {
                 }
                 self.tile_group(payload)?;
             }
+            OBU_METADATA => match crate::obu::parse_metadata(payload) {
+                Some(Metadata::ContentLight(c)) => self.hdr.content_light = Some(c),
+                Some(Metadata::MasteringDisplay(m)) => self.hdr.mastering_display = Some(m),
+                None => {}
+            },
             OBU_TILE_LIST => {
                 return Err(Error::unsupported(
                     "large scale tile decoding (tile list OBUs)",
@@ -625,13 +651,8 @@ impl Decoder {
         let mut frame = Frame::new(w as u32, h as u32, data.bit_depth, chroma);
         frame.render_width = data.render_width;
         frame.render_height = data.render_height;
-        frame.color = ColorInfo {
-            color_primaries: seq.color.color_primaries,
-            transfer_characteristics: seq.color.transfer_characteristics,
-            matrix_coefficients: seq.color.matrix_coefficients,
-            full_range: seq.color.color_range,
-            chroma_sample_position: seq.color.chroma_sample_position,
-        };
+        frame.color = color_info(&seq.color);
+        frame.hdr = self.hdr;
         let mut planes: Vec<Vec<u16>> = Vec::new();
         for (p, pl) in data.frame.planes.iter().enumerate() {
             let (sx, sy) = if p == 0 {
@@ -797,6 +818,17 @@ impl Decoder {
             }
         }
         (refs, mvs)
+    }
+}
+
+/// The public colour description of a `color_config()`.
+fn color_info(c: &crate::obu::ColorConfig) -> ColorInfo {
+    ColorInfo {
+        color_primaries: c.color_primaries,
+        transfer_characteristics: c.transfer_characteristics,
+        matrix_coefficients: c.matrix_coefficients,
+        full_range: c.color_range,
+        chroma_sample_position: c.chroma_sample_position,
     }
 }
 

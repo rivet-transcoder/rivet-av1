@@ -24,7 +24,7 @@ use crate::bits::{BitReader, BitWriter};
 use crate::consts::*;
 use crate::decoder::Decoder;
 use crate::decoder::tile::TileDecoder;
-use crate::frame::{ChromaFormat, Frame};
+use crate::frame::{ChromaFormat, ColorInfo, Frame, HdrMetadata};
 use crate::header::FrameHeader;
 use crate::obu::{ColorConfig, SequenceHeader, write_obu};
 use crate::tables::AC_QLOOKUP;
@@ -51,6 +51,16 @@ pub struct Config {
     pub loop_filter: Option<u32>,
     /// Half-width of the full-pel motion search, in pixels.
     pub search_range: i32,
+    /// The colour description written into the sequence header's
+    /// `color_config()`: primaries, transfer characteristics and matrix
+    /// (ITU-T H.273 code points), range and chroma sample position. All
+    /// three code points 2 (unspecified, the default) writes
+    /// `color_description_present_flag` = 0.
+    pub color: ColorInfo,
+    /// HDR metadata, written as metadata OBUs (`METADATA_TYPE_HDR_CLL`,
+    /// `METADATA_TYPE_HDR_MDCV`) after the sequence header of every key
+    /// frame's temporal unit.
+    pub hdr: HdrMetadata,
 }
 
 impl Config {
@@ -65,6 +75,8 @@ impl Config {
             target_bits_per_frame: None,
             loop_filter: None,
             search_range: 16,
+            color: ColorInfo::default(),
+            hdr: HdrMetadata::default(),
         }
     }
 }
@@ -77,6 +89,12 @@ pub struct Encoder {
     /// shares; its output is the encoder's reconstruction.
     dec: Decoder,
     frame_num: u64,
+    /// Frames since the last key frame.
+    since_key: u64,
+    /// The next frame is to be a key frame whatever the interval says.
+    force_key: bool,
+    /// Whether the last frame encoded was a key frame.
+    last_key: bool,
     q: f64,
     recon: Option<Frame>,
 }
@@ -128,15 +146,17 @@ impl Encoder {
                 bit_depth: cfg.bit_depth,
                 mono_chrome: false,
                 num_planes: 3,
-                color_primaries: CP_UNSPECIFIED,
-                transfer_characteristics: TC_UNSPECIFIED,
-                matrix_coefficients: MC_UNSPECIFIED,
-                color_range: false,
+                color_primaries: cfg.color.color_primaries,
+                transfer_characteristics: cfg.color.transfer_characteristics,
+                matrix_coefficients: cfg.color.matrix_coefficients,
+                color_range: cfg.color.full_range,
                 subsampling_x: 1,
                 subsampling_y: 1,
-                chroma_sample_position: CSP_UNKNOWN,
+                chroma_sample_position: cfg.color.chroma_sample_position,
                 separate_uv_delta_q: false,
-                color_description_present: false,
+                color_description_present: cfg.color.color_primaries != CP_UNSPECIFIED
+                    || cfg.color.transfer_characteristics != TC_UNSPECIFIED
+                    || cfg.color.matrix_coefficients != MC_UNSPECIFIED,
             },
             film_grain_params_present: false,
         };
@@ -146,6 +166,9 @@ impl Encoder {
             seq: Arc::new(seq),
             dec: Decoder::new(),
             frame_num: 0,
+            since_key: 0,
+            force_key: false,
+            last_key: false,
             q,
             recon: None,
         }
@@ -155,6 +178,31 @@ impl Encoder {
     /// output for it.
     pub fn reconstruction(&self) -> Option<&Frame> {
         self.recon.as_ref()
+    }
+
+    /// Makes the next frame a key frame (with its sequence header and
+    /// metadata OBUs, so the stream can be entered there), whatever the
+    /// key frame interval says; the interval restarts from it. Nothing
+    /// else is reset: the rate controller carries on.
+    pub fn force_keyframe(&mut self) {
+        self.force_key = true;
+    }
+
+    /// Whether the next frame will be a key frame.
+    pub fn next_is_keyframe(&self) -> bool {
+        self.force_key
+            || self.frame_num == 0
+            || self.since_key >= self.cfg.keyframe_interval.max(1) as u64
+    }
+
+    /// Whether the last frame encoded was a key frame.
+    pub fn last_was_keyframe(&self) -> bool {
+        self.last_key
+    }
+
+    /// The configuration.
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     /// The quantiser index the next frame will use.
@@ -177,9 +225,8 @@ impl Encoder {
         if cfg.bit_depth != 8 && cfg.bit_depth != 10 {
             return Err(Error::invalid("bit depth must be 8 or 10"));
         }
-        let key = self
-            .frame_num
-            .is_multiple_of(cfg.keyframe_interval.max(1) as u64);
+        check_color(&cfg.color)?;
+        let key = self.next_is_keyframe();
         let qidx = self.quantizer();
         let header = self.write_frame_header(key, qidx);
         // Parse it back with the decoder's parser: the frame state is then
@@ -209,16 +256,29 @@ impl Encoder {
         self.dec.shown.clear();
         self.dec.finish_frame(f)?;
         self.recon = self.dec.shown.pop();
+        if let Some(r) = self.recon.as_mut() {
+            // What a decoder reports after this temporal unit's metadata.
+            r.hdr = self.cfg.hdr;
+        }
         // The temporal unit.
         let mut out = Vec::new();
         write_obu(&mut out, OBU_TEMPORAL_DELIMITER, &[]);
         if key {
             write_obu(&mut out, OBU_SEQUENCE_HEADER, &seq.write());
+            if let Some(c) = &self.cfg.hdr.content_light {
+                write_obu(&mut out, OBU_METADATA, &crate::obu::write_hdr_cll(c));
+            }
+            if let Some(m) = &self.cfg.hdr.mastering_display {
+                write_obu(&mut out, OBU_METADATA, &crate::obu::write_hdr_mdcv(m));
+            }
         }
         let mut payload = header;
         payload.extend_from_slice(&tile);
         write_obu(&mut out, OBU_FRAME, &payload);
         self.frame_num += 1;
+        self.since_key = if key { 1 } else { self.since_key + 1 };
+        self.force_key = false;
+        self.last_key = key;
         self.rate_control(out.len() as u64 * 8, key);
         Ok(out)
     }
@@ -358,4 +418,22 @@ impl Encoder {
         w.byte_align();
         w.finish()
     }
+}
+
+/// Whether the encoder can write this colour description: code points in
+/// range, and none that profile 0's 4:2:0 cannot carry (the identity
+/// matrix, and the sRGB triple that implies 4:4:4).
+fn check_color(c: &ColorInfo) -> Result<()> {
+    if c.color_primaries > 255 || c.transfer_characteristics > 255 || c.matrix_coefficients > 255 {
+        return Err(Error::invalid("colour code points are 8-bit values"));
+    }
+    if c.chroma_sample_position > 3 {
+        return Err(Error::invalid("chroma_sample_position is 0 to 3"));
+    }
+    if c.matrix_coefficients == MC_IDENTITY {
+        return Err(Error::invalid(
+            "the identity matrix (RGB) needs 4:4:4; the encoder writes 4:2:0",
+        ));
+    }
+    Ok(())
 }

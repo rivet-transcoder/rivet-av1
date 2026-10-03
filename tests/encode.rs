@@ -136,6 +136,94 @@ fn ten_bit() {
     assert!(psnr(&frames[2], &dec[2], 0) > 30.0);
 }
 
+/// 10-bit PQ (HDR10) and HLG: the colour description and the HDR
+/// metadata OBUs reach a fresh decoder, on every frame.
+#[test]
+fn hdr_signalling_round_trips() {
+    use av1::{ColorInfo, ContentLightLevel, HdrMetadata, MasteringDisplay};
+    let frames: Vec<Frame> = (0..4).map(|t| synthetic(64, 48, t, 10)).collect();
+    let mdcv = MasteringDisplay {
+        // BT.2020 primaries, D65, 1000 / 0.005 cd/m2.
+        primaries: [[46_396, 19_235], [11_141, 52_429], [8_651, 3_015]],
+        white_point: [20_493, 21_561],
+        luminance_max: 1000 << 8,
+        luminance_min: 82,
+    };
+    let cll = ContentLightLevel {
+        max_cll: 1000,
+        max_fall: 400,
+    };
+    for (tc, hdr) in [
+        (
+            16,
+            HdrMetadata {
+                content_light: Some(cll),
+                mastering_display: Some(mdcv),
+            },
+        ),
+        (18, HdrMetadata::default()),
+    ] {
+        let color = ColorInfo {
+            color_primaries: 9,
+            transfer_characteristics: tc,
+            matrix_coefficients: 9,
+            full_range: false,
+            chroma_sample_position: 2,
+        };
+        let mut cfg = Config::new(64, 48);
+        cfg.bit_depth = 10;
+        cfg.keyframe_interval = 2;
+        cfg.color = color;
+        cfg.hdr = hdr;
+        let (dec, _) = round_trip(cfg, &frames);
+        for d in &dec {
+            assert_eq!(d.color, color);
+            assert_eq!(d.hdr, hdr);
+        }
+    }
+    // The identity matrix needs 4:4:4: refused by name.
+    let mut cfg = Config::new(16, 16);
+    cfg.color.matrix_coefficients = 0;
+    let err = Encoder::new(cfg)
+        .encode(&synthetic(16, 16, 0, 8))
+        .unwrap_err();
+    assert!(err.to_string().contains("4:4:4"), "{err}");
+}
+
+/// `force_keyframe()`: the next frame is a key frame a fresh decoder can
+/// start at; the interval restarts from it.
+#[test]
+fn forced_key_frames() {
+    let frames: Vec<Frame> = (0..9).map(|t| synthetic(64, 48, t, 8)).collect();
+    let mut cfg = Config::new(64, 48);
+    cfg.keyframe_interval = 4;
+    let mut enc = Encoder::new(cfg);
+    let mut keys = Vec::new();
+    let mut packets = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        if i == 2 {
+            enc.force_keyframe();
+        }
+        assert_eq!(enc.next_is_keyframe(), [0, 2, 6].contains(&i), "frame {i}");
+        packets.push(enc.encode(f).unwrap());
+        keys.push(enc.last_was_keyframe());
+        // From the forced key on, a decoder that starts there agrees.
+        if i >= 2 {
+            let mut d = Decoder::new();
+            d.set_strict(true);
+            let mut last = None;
+            for p in &packets[2..] {
+                last = d.decode(p).unwrap();
+            }
+            assert_eq!(last.as_ref(), enc.reconstruction(), "frame {i}");
+        }
+    }
+    assert_eq!(
+        keys,
+        [true, false, true, false, false, false, true, false, false]
+    );
+}
+
 #[test]
 fn natural_video_quality_tracks_the_quantiser() {
     let src = natural(6);

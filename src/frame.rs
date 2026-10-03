@@ -74,6 +74,50 @@ impl Default for ColorInfo {
     }
 }
 
+/// Content light level (`metadata_hdr_cll()`, 5.8.3): CTA-861.3's MaxCLL
+/// and MaxFALL, in candelas per square metre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ContentLightLevel {
+    /// `max_cll`: the maximum content light level.
+    pub max_cll: u16,
+    /// `max_fall`: the maximum frame-average light level.
+    pub max_fall: u16,
+}
+
+/// Mastering display colour volume (`metadata_hdr_mdcv()`, 5.8.4), in the
+/// bitstream's fixed-point units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct MasteringDisplay {
+    /// CIE 1931 `[x, y]` of the red, green and blue primaries, 0.16 fixed
+    /// point (50 000 / 65 536 is 0.763; a value of `round(c * 65536)`).
+    pub primaries: [[u16; 2]; 3],
+    /// CIE 1931 `[x, y]` of the white point, 0.16 fixed point.
+    pub white_point: [u16; 2],
+    /// Maximum luminance, cd/m², 24.8 fixed point (1000 cd/m² is
+    /// `1000 << 8`).
+    pub luminance_max: u32,
+    /// Minimum luminance, cd/m², 18.14 fixed point (0.005 cd/m² is
+    /// `round(0.005 * 16384)` = 82).
+    pub luminance_min: u32,
+}
+
+/// The high-dynamic-range metadata a stream carries in metadata OBUs
+/// (5.8): each part `None` when the stream has not sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct HdrMetadata {
+    /// `METADATA_TYPE_HDR_CLL`.
+    pub content_light: Option<ContentLightLevel>,
+    /// `METADATA_TYPE_HDR_MDCV`.
+    pub mastering_display: Option<MasteringDisplay>,
+}
+
+impl HdrMetadata {
+    /// Whether neither part is present.
+    pub fn is_empty(&self) -> bool {
+        self.content_light.is_none() && self.mastering_display.is_none()
+    }
+}
+
 /// One plane of a [`Frame`]: where it sits in the frame's data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Plane {
@@ -99,6 +143,9 @@ pub struct Frame {
     pub chroma: ChromaFormat,
     /// Colour description, as signalled.
     pub color: ColorInfo,
+    /// HDR metadata: the most recent content light level and mastering
+    /// display metadata OBUs the stream carried before this frame.
+    pub hdr: HdrMetadata,
     /// The display size the stream asks for (`render_size`); a hint only.
     pub render_width: u32,
     /// See [`Self::render_width`].
@@ -136,6 +183,7 @@ impl Frame {
             bit_depth,
             chroma,
             color: ColorInfo::default(),
+            hdr: HdrMetadata::default(),
             render_width: width,
             render_height: height,
             data: vec![0u8; offset],

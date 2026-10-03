@@ -51,7 +51,9 @@ pub(crate) mod tables;
 
 pub use decoder::{Decoder, annexb_temporal_units};
 pub use encoder::{Config, Encoder};
-pub use frame::{ChromaFormat, ColorInfo, Frame, Plane};
+pub use frame::{
+    ChromaFormat, ColorInfo, ContentLightLevel, Frame, HdrMetadata, MasteringDisplay, Plane,
+};
 
 /// Errors the decoder and encoder can report.
 #[derive(Debug, thiserror::Error)]

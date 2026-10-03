@@ -461,3 +461,68 @@ fn parse_color_config(r: &mut BitReader, seq_profile: u32) -> Result<ColorConfig
     c.separate_uv_delta_q = r.flag()?;
     Ok(c)
 }
+
+/// `metadata_type` of the HDR metadata OBUs (6.7.1).
+pub(crate) const METADATA_TYPE_HDR_CLL: u64 = 1;
+pub(crate) const METADATA_TYPE_HDR_MDCV: u64 = 2;
+
+/// The payload of a `METADATA_TYPE_HDR_CLL` metadata OBU (5.8.1, 5.8.3).
+pub(crate) fn write_hdr_cll(c: &crate::frame::ContentLightLevel) -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::bits::write_leb128(&mut out, METADATA_TYPE_HDR_CLL);
+    let mut w = BitWriter::new();
+    w.f(16, c.max_cll as u32);
+    w.f(16, c.max_fall as u32);
+    w.trailing_bits();
+    out.extend_from_slice(&w.finish());
+    out
+}
+
+/// The payload of a `METADATA_TYPE_HDR_MDCV` metadata OBU (5.8.1, 5.8.4).
+pub(crate) fn write_hdr_mdcv(m: &crate::frame::MasteringDisplay) -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::bits::write_leb128(&mut out, METADATA_TYPE_HDR_MDCV);
+    let mut w = BitWriter::new();
+    for p in &m.primaries {
+        w.f(16, p[0] as u32);
+        w.f(16, p[1] as u32);
+    }
+    w.f(16, m.white_point[0] as u32);
+    w.f(16, m.white_point[1] as u32);
+    w.f(32, m.luminance_max);
+    w.f(32, m.luminance_min);
+    w.trailing_bits();
+    out.extend_from_slice(&w.finish());
+    out
+}
+
+/// A metadata OBU the decoder keeps (5.8).
+pub(crate) enum Metadata {
+    ContentLight(crate::frame::ContentLightLevel),
+    MasteringDisplay(crate::frame::MasteringDisplay),
+}
+
+/// `metadata_obu()`: the HDR types; others (and ones cut short, which a
+/// decoder may ignore as it ignores any metadata) give `None`.
+pub(crate) fn parse_metadata(payload: &[u8]) -> Option<Metadata> {
+    let mut r = BitReader::new(payload);
+    let t = r.leb128().ok()?;
+    match t {
+        METADATA_TYPE_HDR_CLL => Some(Metadata::ContentLight(crate::frame::ContentLightLevel {
+            max_cll: r.f(16).ok()? as u16,
+            max_fall: r.f(16).ok()? as u16,
+        })),
+        METADATA_TYPE_HDR_MDCV => {
+            let mut m = crate::frame::MasteringDisplay::default();
+            for p in m.primaries.iter_mut() {
+                p[0] = r.f(16).ok()? as u16;
+                p[1] = r.f(16).ok()? as u16;
+            }
+            m.white_point = [r.f(16).ok()? as u16, r.f(16).ok()? as u16];
+            m.luminance_max = r.f(32).ok()?;
+            m.luminance_min = r.f(32).ok()?;
+            Some(Metadata::MasteringDisplay(m))
+        }
+        _ => None,
+    }
+}
