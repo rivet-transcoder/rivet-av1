@@ -688,6 +688,14 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             } else {
                 self.f.num_planes > 1
             };
+        // A block whose chroma has no size at this subsampling (a 4x16 at
+        // 4:2:2, say): bitstream conformance requires
+        // get_plane_residual_size(MiSize, 1) not to be BLOCK_INVALID (6.10.4).
+        if self.b.has_chroma && self.f.plane_residual_size(sub_size, 1) == BLOCK_INVALID {
+            return Err(crate::Error::bitstream(
+                "a block size with no chroma size at this subsampling",
+            ));
+        }
         let (ri, ci) = (r as isize, c as isize);
         let avail_u = self.is_inside(ri - 1, ci);
         let avail_l = self.is_inside(ri, ci - 1);
