@@ -1249,6 +1249,7 @@ impl Parser<'_, '_> {
             g.point_y_value[i] = self.r.f(8)? as i32;
             g.point_y_scaling[i] = self.r.f(8)? as i32;
         }
+        increasing(&g.point_y_value[..g.num_y_points], "point_y_value")?;
         let c = &seq.color;
         g.chroma_scaling_from_luma = if c.mono_chrome { false } else { self.r.flag()? };
         if c.mono_chrome
@@ -1274,6 +1275,8 @@ impl Parser<'_, '_> {
                 g.point_cr_value[i] = self.r.f(8)? as i32;
                 g.point_cr_scaling[i] = self.r.f(8)? as i32;
             }
+            increasing(&g.point_cb_value[..g.num_cb_points], "point_cb_value")?;
+            increasing(&g.point_cr_value[..g.num_cr_points], "point_cr_value")?;
         }
         g.grain_scaling_minus_8 = self.r.f(2)?;
         g.ar_coeff_lag = self.r.f(2)? as i32;
@@ -1345,4 +1348,15 @@ pub(crate) fn get_qindex_header(h: &FrameHeader, segment_id: usize) -> u32 {
     } else {
         h.base_q_idx
     }
+}
+
+/// The film grain points' values must increase: bitstream conformance
+/// requires each `point_y_value` / `point_cb_value` / `point_cr_value` to be
+/// greater than the one before (6.8.20), and the scaling function's
+/// interpolation (7.18.3.5) divides by their differences.
+fn increasing(values: &[i32], name: &str) -> Result<()> {
+    if values.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(Error::bitstream(format!("{name} does not increase")));
+    }
+    Ok(())
 }
