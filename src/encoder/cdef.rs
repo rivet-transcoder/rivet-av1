@@ -55,6 +55,7 @@ pub(crate) fn search(
     stride: &[usize],
     lambda: f64,
     thorough: bool,
+    threads: usize,
 ) -> (CdefParams, Vec<i8>) {
     let y_pri: &[u32] = if thorough {
         &[0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15]
@@ -96,11 +97,14 @@ pub(crate) fn search(
     }
     let ny = ycands.len();
     let nuv = uvcands.len();
-    let mut ysse = vec![0u64; blocks.len() * ny];
-    let mut uvsse = vec![0u64; blocks.len() * nuv];
-    let mut res = [0u16; 64];
     let cols = f.ms;
-    for (bi, &(fr, fc)) in blocks.iter().enumerate() {
+    // Each block's error for each luma and chroma strength, the blocks on
+    // `threads` threads.
+    let per_block = crate::decoder::parallel_map(blocks.len(), threads.max(1), |bi| {
+        let (fr, fc) = blocks[bi];
+        let mut ysse = vec![0u64; ny];
+        let mut uvsse = vec![0u64; nuv];
+        let mut res = [0u16; 64];
         for r in (fr * 16..(fr * 16 + 16).min(f.mi_rows)).step_by(2) {
             for c in (fc * 16..(fc * 16 + 16).min(f.mi_cols)).step_by(2) {
                 let sk = |rr: usize, cc: usize| f.mi[rr * cols + cc].skip;
@@ -143,7 +147,7 @@ pub(crate) fn search(
                         coeff_shift,
                         &mut res,
                     );
-                    ysse[bi * ny + k] += block_sse(&res, 8, 8, &src[0], stride[0], x0, y0, f, 0);
+                    ysse[k] += block_sse(&res, 8, 8, &src[0], stride[0], x0, y0, f, 0);
                 }
                 // Chroma.
                 if f.num_planes > 1 {
@@ -179,12 +183,15 @@ pub(crate) fn search(
                             );
                             total += block_sse(&res, w, h, &src[p], stride[p], cx0, cy0, f, p);
                         }
-                        uvsse[bi * nuv + k] += total;
+                        uvsse[k] += total;
                     }
                 }
             }
         }
-    }
+        (ysse, uvsse)
+    });
+    let ysse: Vec<u64> = per_block.iter().flat_map(|b| b.0.iter().copied()).collect();
+    let uvsse: Vec<u64> = per_block.iter().flat_map(|b| b.1.iter().copied()).collect();
     // Greedy choice of up to 2^bits (luma, chroma) pairs, for each bits.
     let nb = blocks.len();
     let best_for = |set: &[(usize, usize)]| -> (f64, Vec<usize>) {

@@ -335,19 +335,23 @@ fn natural_video_quality_tracks_the_quantiser() {
     }
 }
 
+/// Average-bitrate mode spends its budget: over 24 frames of natural video
+/// (a key frame first), within 8 % of the target (`examples/ratetest.rs`
+/// measures 10-second clips of several kinds).
 #[test]
 fn rate_control_tracks_the_target() {
-    let src = natural(8);
-    let mut cfg = cfg_for(src[0].width, src[0].height);
-    cfg.quantizer = 60;
-    cfg.keyframe_interval = 100;
-    let target = 20_000u64;
-    cfg.target_bits_per_frame = Some(target);
-    let (_, sizes) = round_trip(cfg, &src);
-    let inter_bits: u64 =
-        sizes[4..].iter().map(|&s| s as u64 * 8).sum::<u64>() / (sizes.len() - 4) as u64;
-    eprintln!("rate control: sizes {sizes:?}, inter average {inter_bits} bits for target {target}");
-    assert!(inter_bits < target * 3 && inter_bits > target / 3);
+    let src = natural(24);
+    for target in [8_000u64, 30_000] {
+        let mut cfg = cfg_for(src[0].width, src[0].height);
+        cfg.quantizer = 60;
+        cfg.keyframe_interval = 100;
+        cfg.target_bits_per_frame = Some(target);
+        let (_, sizes) = round_trip(cfg, &src);
+        let bits: u64 = sizes.iter().map(|&s| s as u64 * 8).sum();
+        let ratio = bits as f64 / (target * sizes.len() as u64) as f64;
+        eprintln!("rate control: target {target} bits a frame, sizes {sizes:?}, {ratio:.3}x");
+        assert!((0.92..1.08).contains(&ratio), "{ratio:.3}x the target");
+    }
 }
 
 /// The README table: sizes and PSNR at several quantisers on 8 frames of

@@ -9,11 +9,13 @@
 
 use crate::consts::*;
 use crate::decoder::FrameCtx;
+use crate::decoder::parallel_map;
 use crate::decoder::postfilter::{
     LRB, LrBuffers, LrCtx, LrParams, box_filter_rect, lr_stripe, lr_unit_cols, lr_window,
     restore_rect_from_window,
 };
 use crate::decoder::state::FrameBuf;
+use crate::dsp::enc::sse_row;
 use crate::tables::*;
 
 /// One unit's restoration, as `read_lr_unit()` codes it.
@@ -38,6 +40,10 @@ pub(crate) struct LrPlan {
 const SGR_SETS_NORMAL: [usize; 6] = [0, 3, 6, 10, 13, 14];
 const SGR_SETS_FAST: [usize; 2] = [3, 10];
 
+/// A stripe's part of a unit row: `StripeStartY`, `StripeEndY`, and the
+/// first and last rows it restores.
+type Stripe = (i32, i32, i32, i32);
+
 /// How hard the search works.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Effort {
@@ -52,8 +58,9 @@ pub(crate) enum Effort {
 
 /// Chooses the restoration of every unit of every plane of `f` (whose
 /// header asks for switchable restoration in each, so its unit arrays are
-/// set up). `cur` is the deblocked frame, `cdef` the CDEF output; `src` the
-/// source planes.
+/// set up), on `threads` threads. `cur` is the deblocked frame, `cdef` the
+/// CDEF output; `src` the source planes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search(
     f: &FrameCtx,
     cur: &FrameBuf,
@@ -62,6 +69,7 @@ pub(crate) fn search(
     stride: &[usize],
     lambda: f64,
     effort: Effort,
+    threads: usize,
 ) -> LrPlan {
     let mut plan = LrPlan::default();
     let sets: Vec<usize> = match effort {
@@ -71,126 +79,131 @@ pub(crate) fn search(
     };
     let step = if effort == Effort::Fast { 2 } else { 1 };
     let stripes = (f.hdr.frame_height as usize + 8).div_ceil(64);
+    // The stripes of each unit row of each plane.
+    let mut rows: [Vec<Vec<Stripe>>; 3] = Default::default();
+    // Every unit of every plane, one job each.
+    let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
     for plane in 0..f.num_planes {
         let lp = &f.lr[plane];
-        let units = lp.unit_rows * lp.unit_cols;
-        if units == 0 {
-            continue;
-        }
-        let mut choices = vec![LrChoice::default(); units];
-        let mut buf = LrBuffers::default();
-        // The stripes of each unit row.
-        let mut rows: Vec<Vec<(i32, i32, i32, i32)>> = vec![Vec::new(); lp.unit_rows];
+        rows[plane] = vec![Vec::new(); lp.unit_rows];
         for s in 0..stripes {
             if let Some((ss, se, y0, y1, ur)) = lr_stripe(f, plane, s) {
-                rows[ur].push((ss, se, y0, y1));
+                rows[plane][ur].push((ss, se, y0, y1));
             }
         }
+        for ur in 0..lp.unit_rows {
+            for uc in 0..lp.unit_cols {
+                jobs.push((plane, ur, uc));
+            }
+        }
+    }
+    let unit = |&(plane, ur, uc): &(usize, usize, usize)| -> Option<LrChoice> {
         let (sub_x, sub_y) = f.plane_ss(plane);
         let plane_end_x = crate::consts::round2(f.hdr.upscaled_width as i32, sub_x as u32) - 1;
         let plane_end_y = crate::consts::round2(f.hdr.frame_height as i32, sub_y as u32) - 1;
-        let mut wiener_bits = 0usize;
-        let mut sgr_bits = 0usize;
-        for ur in 0..lp.unit_rows {
-            for uc in 0..lp.unit_cols {
-                let (x0, x1) = lr_unit_cols(f, plane, uc);
-                if x0 > plane_end_x || rows[ur].is_empty() {
-                    continue;
-                }
-                let w = (x1 - x0 + 1) as usize;
-                // The unit's rectangles, one per stripe.
-                let rects: Vec<(LrCtx, i32, usize)> = rows[ur]
-                    .iter()
-                    .map(|&(ss, se, y0, y1)| {
-                        (
-                            LrCtx {
-                                cur: &cur.planes[plane],
-                                cdef: &cdef.planes[plane],
-                                stripe_start_y: ss,
-                                stripe_end_y: se,
-                                plane_end_x,
-                                plane_end_y,
-                            },
-                            y0,
-                            (y1 - y0 + 1) as usize,
-                        )
-                    })
-                    .collect();
-                let sse_of = |buf: &mut LrBuffers, params: Option<&LrParams>| -> u64 {
-                    let mut total = 0u64;
-                    for (ctx, y0, h) in &rects {
+        let (x0, x1) = lr_unit_cols(f, plane, uc);
+        if x0 > plane_end_x || rows[plane][ur].is_empty() {
+            return None;
+        }
+        let mut buf = LrBuffers::default();
+        let w = (x1 - x0 + 1) as usize;
+        // The unit's rectangles, one per stripe.
+        let rects: Vec<(LrCtx, i32, usize)> = rows[plane][ur]
+            .iter()
+            .map(|&(ss, se, y0, y1)| {
+                (
+                    LrCtx {
+                        cur: &cur.planes[plane],
+                        cdef: &cdef.planes[plane],
+                        stripe_start_y: ss,
+                        stripe_end_y: se,
+                        plane_end_x,
+                        plane_end_y,
+                    },
+                    y0,
+                    (y1 - y0 + 1) as usize,
+                )
+            })
+            .collect();
+        let sse_of = |buf: &mut LrBuffers, params: Option<&LrParams>| -> u64 {
+            let mut total = 0u64;
+            for (ctx, y0, h) in &rects {
+                let st = stride[plane];
+                match params {
+                    Some(p) => {
                         lr_window(ctx, x0, *y0, w, *h, buf);
-                        match params {
-                            Some(p) => restore_rect_from_window(f, ctx, x0, *y0, w, *h, p, buf),
-                            None => {
-                                buf.out.resize(w * h, 0);
-                                for i in 0..*h {
-                                    for j in 0..w {
-                                        buf.out[i * w + j] =
-                                            ctx.cdef.get(x0 as usize + j, *y0 as usize + i);
-                                    }
-                                }
-                            }
-                        }
+                        restore_rect_from_window(f, ctx, x0, *y0, w, *h, p, buf);
                         for i in 0..*h {
-                            let so = (*y0 as usize + i) * stride[plane] + x0 as usize;
-                            for j in 0..w {
-                                let d = buf.out[i * w + j] as i64 - src[plane][so + j] as i64;
-                                total += (d * d) as u64;
-                            }
+                            let so = (*y0 as usize + i) * st + x0 as usize;
+                            total += sse_row(&buf.out[i * w..(i + 1) * w], &src[plane][so..so + w]);
                         }
                     }
-                    total
-                };
-                let none = sse_of(&mut buf, None);
-                let mut best = (none as f64 + lambda, LrChoice::default());
-                // Wiener.
-                let coef = fit_wiener(plane, &rects, x0, w, src, stride, step, &mut buf);
-                let p = LrParams::Wiener(coef);
-                let e = sse_of(&mut buf, Some(&p));
-                let cost = e as f64 + lambda * if plane == 0 { 40.0 } else { 28.0 };
-                if cost < best.0 {
-                    best = (
-                        cost,
-                        LrChoice {
-                            t: RESTORE_WIENER,
-                            wiener: coef,
-                            ..Default::default()
-                        },
-                    );
-                }
-                // Self-guided.
-                for &set in &sets {
-                    let (xqd, e) =
-                        fit_sgr(f, set, &rects, x0, w, src, stride, plane, step, &mut buf);
-                    let cost = e as f64 + lambda * 20.0;
-                    if cost < best.0 {
-                        best = (
-                            cost,
-                            LrChoice {
-                                t: RESTORE_SGRPROJ,
-                                set: set as u8,
-                                xqd,
-                                ..Default::default()
-                            },
-                        );
+                    None => {
+                        let pl = ctx.cdef;
+                        for i in 0..*h {
+                            let y = *y0 as usize + i;
+                            let so = y * st + x0 as usize;
+                            let co = y * pl.stride + x0 as usize;
+                            total += sse_row(&pl.data[co..co + w], &src[plane][so..so + w]);
+                        }
                     }
                 }
-                match best.1.t {
-                    RESTORE_WIENER => wiener_bits += 1,
-                    RESTORE_SGRPROJ => sgr_bits += 1,
-                    _ => {}
-                }
-                choices[ur * lp.unit_cols + uc] = best.1;
+            }
+            total
+        };
+        let none = sse_of(&mut buf, None);
+        let mut best = (none as f64 + lambda, LrChoice::default());
+        // Wiener.
+        let coef = fit_wiener(plane, &rects, x0, w, src, stride, step, &mut buf);
+        let p = LrParams::Wiener(coef);
+        let e = sse_of(&mut buf, Some(&p));
+        let cost = e as f64 + lambda * if plane == 0 { 40.0 } else { 28.0 };
+        if cost < best.0 {
+            best = (
+                cost,
+                LrChoice {
+                    t: RESTORE_WIENER,
+                    wiener: coef,
+                    ..Default::default()
+                },
+            );
+        }
+        // Self-guided.
+        for &set in &sets {
+            let (xqd, e) = fit_sgr(f, set, &rects, x0, w, src, stride, plane, step, &mut buf);
+            let cost = e as f64 + lambda * 20.0;
+            if cost < best.0 {
+                best = (
+                    cost,
+                    LrChoice {
+                        t: RESTORE_SGRPROJ,
+                        set: set as u8,
+                        xqd,
+                        ..Default::default()
+                    },
+                );
             }
         }
-        plan.frame_type[plane] = match (wiener_bits > 0, sgr_bits > 0) {
+        Some(best.1)
+    };
+    let results = parallel_map(jobs.len(), threads.max(1), |i| unit(&jobs[i]));
+    for plane in 0..f.num_planes {
+        let lp = &f.lr[plane];
+        plan.units[plane] = vec![LrChoice::default(); lp.unit_rows * lp.unit_cols];
+    }
+    for (&(plane, ur, uc), choice) in jobs.iter().zip(results) {
+        if let Some(c) = choice {
+            plan.units[plane][ur * f.lr[plane].unit_cols + uc] = c;
+        }
+    }
+    for plane in 0..f.num_planes {
+        let used = |t: u8| plan.units[plane].iter().any(|c| c.t == t);
+        plan.frame_type[plane] = match (used(RESTORE_WIENER), used(RESTORE_SGRPROJ)) {
             (false, false) => RESTORE_NONE,
             (true, false) => RESTORE_WIENER,
             (false, true) => RESTORE_SGRPROJ,
             (true, true) => RESTORE_SWITCHABLE,
         };
-        plan.units[plane] = choices;
     }
     plan
 }

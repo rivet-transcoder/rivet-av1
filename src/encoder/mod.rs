@@ -17,6 +17,7 @@
 pub(crate) mod cdef;
 pub(crate) mod fwd;
 pub(crate) mod lr;
+mod rc;
 pub(crate) mod rdo;
 pub(crate) mod tile;
 mod wavefront;
@@ -313,6 +314,8 @@ pub struct Encoder {
     /// Whether the last frame encoded was a key frame.
     last_key: bool,
     q: f64,
+    /// Average-bitrate rate control (`Config::target_bits_per_frame`).
+    rc: Option<rc::RateControl>,
     recon: Option<Frame>,
     /// The frame number each reference slot holds.
     slot_frame: [u64; NUM_REF_FRAMES],
@@ -437,6 +440,16 @@ impl Encoder {
             film_grain_params_present: false,
         };
         let q = cfg.quantizer.clamp(1, 255) as f64;
+        let rc = cfg.target_bits_per_frame.map(|t| {
+            rc::RateControl::new(
+                t,
+                cfg.width,
+                cfg.height,
+                cfg.bit_depth,
+                cfg.keyframe_interval,
+                cfg.quantizer,
+            )
+        });
         let mut dec = Decoder::new();
         dec.set_threads(cfg.threads.max(1));
         Encoder {
@@ -448,6 +461,7 @@ impl Encoder {
             force_key: false,
             last_key: false,
             q,
+            rc,
             recon: None,
             slot_frame: [0; NUM_REF_FRAMES],
             last_slot: 0,
@@ -512,7 +526,6 @@ impl Encoder {
         if self.cfg.tools.palette {
             self.next_screen_content = looks_like_screen_content(frame);
         }
-        let mut p = self.frame_params(key);
         let seq = self.seq.clone();
         if self.dec.seq.is_none() || key {
             self.dec.seq = Some(seq.clone());
@@ -520,6 +533,74 @@ impl Encoder {
         let (src, stride) = self.source_planes(frame);
         let src = Arc::new(src);
         let tools = self.cfg.tools;
+        // Rate control: the quantiser planned for this frame.
+        let golden = !key && tools.multi_ref && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
+        let boost = key || golden;
+        let mut planned = None;
+        if let Some(rc) = self.rc.as_mut() {
+            let class = if key {
+                rc::Class::Key
+            } else {
+                rc::Class::Inter
+            };
+            let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+            let c = rc.measure(&src[0], stride[0], w, h);
+            planned = Some(rc.plan(class, c, |q| if boost { golden_boost(q) } else { 0 }));
+        }
+        let (mut p, mut f, mut out) = self.code_tu(key, &src, &stride, planned.map(|x| x.qidx))?;
+        if let (Some(pl), Some(rc)) = (planned.as_mut(), self.rc.as_mut())
+            && let Some(again) = rc.redo(pl, out.len() as u64 * 8, |q| {
+                if boost { golden_boost(q) } else { 0 }
+            })
+        {
+            // Far from the plan: planned again and coded again.
+            *pl = again;
+            (p, f, out) = self.code_tu(key, &src, &stride, Some(pl.qidx))?;
+        }
+        self.dec.shown.clear();
+        self.dec.finish_frame(f)?;
+        self.recon = self.dec.shown.pop();
+        if let Some(r) = self.recon.as_mut() {
+            // What a decoder reports after this temporal unit's metadata.
+            r.hdr = self.cfg.hdr;
+        }
+        // The reference slots now hold this frame.
+        for i in 0..NUM_REF_FRAMES {
+            if (p.refresh >> i) & 1 != 0 {
+                self.slot_frame[i] = self.frame_num;
+            }
+        }
+        if key {
+            self.last_slot = 0;
+            self.last2_slot = 1;
+        } else if tools.multi_ref {
+            std::mem::swap(&mut self.last_slot, &mut self.last2_slot);
+        }
+        self.frame_num += 1;
+        self.since_key = if key { 1 } else { self.since_key + 1 };
+        self.force_key = false;
+        self.last_key = key;
+        if let (Some(pl), Some(rc)) = (planned.as_ref(), self.rc.as_mut()) {
+            rc.update(pl, out.len() as u64 * 8, !key && !golden);
+            self.q = rc.base_q as f64;
+        }
+        Ok(out)
+    }
+
+    /// Codes one frame (both passes and the filter searches) into its
+    /// temporal unit, at quantiser `qidx` (else the configured one), without
+    /// committing it: the frame state comes back for `finish_frame`.
+    fn code_tu(
+        &mut self,
+        key: bool,
+        src: &Arc<Vec<Vec<u16>>>,
+        stride: &[usize],
+        qidx: Option<u32>,
+    ) -> Result<(FrameParams, crate::decoder::FrameCtx, Vec<u8>)> {
+        let seq = self.seq.clone();
+        let tools = self.cfg.tools;
+        let (src, stride) = (src.clone(), stride.to_vec());
+        let mut p = self.frame_params(key, qidx);
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
         if tools.lf_search || tools.cdef || tools.restoration || coded.tiles.is_empty() {
             // The in-loop filters' parameters, chosen on the first pass's
@@ -527,7 +608,7 @@ impl Encoder {
             // first pass's decisions.
             let mut f = coded.f;
             if tools.lf_search && self.cfg.loop_filter.is_none() {
-                p.lf = search_lf(&mut f, &src, &stride, p.lf);
+                p.lf = search_lf(&mut f, &src, &stride, p.lf, self.cfg.threads.max(1));
             }
             f.hdr.loop_filter_level = p.lf.map(|l| l as i32);
             if p.lf[0] != 0 || p.lf[1] != 0 {
@@ -536,7 +617,14 @@ impl Encoder {
             let mut cdef_table = None;
             let lambda = rd_lambda(&self.cfg, p.qidx);
             if tools.cdef {
-                let (params, table) = cdef::search(&f, &src, &stride, lambda, tools.cdef_thorough);
+                let (params, table) = cdef::search(
+                    &f,
+                    &src,
+                    &stride,
+                    lambda,
+                    tools.cdef_thorough,
+                    self.cfg.threads.max(1),
+                );
                 // The chosen CDEF, as the decoder will apply it.
                 let h = &mut f.hdr;
                 h.cdef_damping = params.damping_minus_3 as i32 + 3;
@@ -569,6 +657,7 @@ impl Encoder {
                     } else {
                         lr::Effort::Normal
                     },
+                    self.cfg.threads.max(1),
                 );
                 p.lr = Some(plan.frame_type);
                 lr_plan = Some(Arc::new(plan));
@@ -583,13 +672,6 @@ impl Encoder {
         let Coded {
             f, header, tiles, ..
         } = coded;
-        self.dec.shown.clear();
-        self.dec.finish_frame(f)?;
-        self.recon = self.dec.shown.pop();
-        if let Some(r) = self.recon.as_mut() {
-            // What a decoder reports after this temporal unit's metadata.
-            r.hdr = self.cfg.hdr;
-        }
         // The temporal unit.
         let mut out = Vec::new();
         write_obu(&mut out, OBU_TEMPORAL_DELIMITER, &[]);
@@ -615,31 +697,14 @@ impl Encoder {
             payload.extend_from_slice(t);
         }
         write_obu(&mut out, OBU_FRAME, &payload);
-        // The reference slots now hold this frame.
-        for i in 0..NUM_REF_FRAMES {
-            if (p.refresh >> i) & 1 != 0 {
-                self.slot_frame[i] = self.frame_num;
-            }
-        }
-        if key {
-            self.last_slot = 0;
-            self.last2_slot = 1;
-        } else if tools.multi_ref {
-            std::mem::swap(&mut self.last_slot, &mut self.last2_slot);
-        }
-        self.frame_num += 1;
-        self.since_key = if key { 1 } else { self.since_key + 1 };
-        self.force_key = false;
-        self.last_key = key;
-        self.rate_control(out.len() as u64 * 8, key);
-        Ok(out)
+        Ok((p, f, out))
     }
 
     /// The header parameters of the next frame (before the in-loop filter
     /// search).
-    fn frame_params(&self, key: bool) -> FrameParams {
+    fn frame_params(&self, key: bool, planned_q: Option<u32>) -> FrameParams {
         let tools = self.cfg.tools;
-        let mut qidx = self.quantizer();
+        let mut qidx = planned_q.unwrap_or_else(|| self.quantizer());
         let mut refresh = 0xFFu8;
         let mut ref_slots = [0usize; REFS_PER_FRAME];
         let mut search_refs = Vec::new();
@@ -652,7 +717,10 @@ impl Encoder {
                 refresh = 1 << self.last2_slot;
                 if golden {
                     refresh |= 1 << GOLDEN_SLOT;
-                    qidx = qidx.saturating_sub(golden_boost(qidx)).max(1);
+                    // (Rate control plans the boost in.)
+                    if planned_q.is_none() {
+                        qidx = qidx.saturating_sub(golden_boost(qidx)).max(1);
+                    }
                 }
                 ref_slots = [
                     self.last_slot,
@@ -841,16 +909,6 @@ impl Encoder {
             tiles,
             logs,
         })
-    }
-
-    fn rate_control(&mut self, bits: u64, key: bool) {
-        let Some(target) = self.cfg.target_bits_per_frame else {
-            return;
-        };
-        // Key frames cost several times an inter frame; aim them higher.
-        let target = if key { target * 4 } else { target } as f64;
-        let ratio = (bits.max(1) as f64 / target.max(1.0)).log2();
-        self.q = (self.q + 12.0 * ratio.clamp(-2.0, 2.0)).clamp(1.0, 255.0);
     }
 
     fn enc_ctx(
@@ -1117,6 +1175,7 @@ fn search_lf(
     src: &[Vec<u16>],
     stride: &[usize],
     start: [u32; 4],
+    threads: usize,
 ) -> [u32; 4] {
     let saved = f.cur.clone();
     let mut best = [(u64::MAX, 0u32); 3];
@@ -1125,7 +1184,7 @@ fn search_lf(
         let levels = [lv(start[0]), lv(start[1]), lv(start[2]), lv(start[3])];
         f.hdr.loop_filter_level = levels.map(|l| l as i32);
         if levels[0] != 0 || levels[1] != 0 {
-            crate::decoder::postfilter::loop_filter(f);
+            crate::decoder::postfilter::loop_filter_threads(f, threads);
         }
         for (p, b) in best.iter_mut().enumerate() {
             let e = plane_sse(f, src, stride, p);

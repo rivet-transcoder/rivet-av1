@@ -60,12 +60,8 @@ impl SharedPlane {
     }
 }
 
-/// The loop filter process (7.14.1), in place on `CurrFrame`.
-pub(crate) fn loop_filter(f: &mut FrameCtx) {
-    loop_filter_threads(f, 1);
-}
-
-/// The loop filter process on up to `threads` threads. The first pass
+/// The loop filter process (7.14.1), in place on `CurrFrame`, on up to
+/// `threads` threads. The first pass
 /// (vertical edges) filters along rows, so bands of rows are independent;
 /// the second (horizontal edges) along columns, so bands of columns are.
 pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
