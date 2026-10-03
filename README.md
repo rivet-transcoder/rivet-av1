@@ -184,7 +184,8 @@ At quantiser 90 the same eight frames take 161 503 bytes coded all-intra.
 
   The suite also carries, per stream, reference output for each operating
   point (`layers/N`, about 75 000 more decodes of the same streams with
-  layers dropped); LAYERS_RESULT The large-scale-tile directories (tile
+  layers dropped): the operating point 1 set was run, **2 763 / 2 763 pass**
+  (`ARGON_LAYERS=1`); the others were not run for time. The large-scale-tile directories (tile
   list OBUs, unsupported) and the error-resilience directories (no
   reference output) are not run.
 - **The encoder** (`tests/encode.rs`): every temporal unit, decoded by a

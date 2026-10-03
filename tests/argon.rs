@@ -89,7 +89,10 @@ fn cases(root: &Path) -> Vec<Case> {
             }
         }
         let layers = std::env::var("ARGON_LAYERS").is_ok();
-        if let Ok(rd) = std::fs::read_dir(md5_dir.join("layers")).map_err(|_| ()).and_then(|r| if layers { Ok(r) } else { Err(()) }) {
+        if let Ok(rd) = std::fs::read_dir(md5_dir.join("layers"))
+            .map_err(|_| ())
+            .and_then(|r| if layers { Ok(r) } else { Err(()) })
+        {
             let mut layers: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
             layers.sort();
             for l in layers {
@@ -104,10 +107,7 @@ fn cases(root: &Path) -> Vec<Case> {
                     let label = format!("{dname}/layers/{n}/{stem}");
                     push(
                         p,
-                        cmd_dir
-                            .join("layers")
-                            .join(&n)
-                            .join(format!("{stem}.sh")),
+                        cmd_dir.join("layers").join(&n).join(format!("{stem}.sh")),
                         label,
                     );
                 }
