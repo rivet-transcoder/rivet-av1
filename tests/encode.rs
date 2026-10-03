@@ -307,6 +307,50 @@ fn alt_ref_groups_round_trip() {
 }
 
 #[test]
+fn monochrome() {
+    // Luma only (`mono_chrome` = 1, as an AVIF alpha plane is coded), full
+    // range: key frames and inter frames, an odd size, every tool the
+    // speed brings; each decodes to the reconstruction and stays mono.
+    let src = natural(3);
+    for (w, h, speed, key) in [(96, 64, 6, 1), (77, 41, 8, 1), (96, 64, 8, 3)] {
+        let frames: Vec<Frame> = src
+            .iter()
+            .map(|f| {
+                let mut m = Frame::new(w, h, 8, ChromaFormat::Mono);
+                for y in 0..h {
+                    for x in 0..w {
+                        m.set_sample(0, x, y, f.sample(0, x + 40, y + 30));
+                    }
+                }
+                m
+            })
+            .collect();
+        let mut cfg = Config::new(w, h);
+        cfg.monochrome = true;
+        cfg.color.full_range = true;
+        cfg.quantizer = 60;
+        cfg.speed = speed;
+        cfg.tools = av1::Tools::for_speed(speed);
+        cfg.keyframe_interval = key;
+        let (dec, _) = round_trip(cfg, &frames);
+        for (a, b) in frames.iter().zip(&dec) {
+            assert_eq!(b.chroma, ChromaFormat::Mono);
+            assert!(
+                b.color.full_range,
+                "the sequence header carries color_range 1"
+            );
+            let q = psnr(a, b, 0);
+            assert!(q > 38.0, "{w}x{h} speed {speed}: luma {q:.1} dB");
+        }
+    }
+    // A 4:2:0 frame is refused by a monochrome encoder.
+    let mut cfg = Config::new(16, 16);
+    cfg.monochrome = true;
+    let e = Encoder::new(cfg).encode(&Frame::new(16, 16, 8, ChromaFormat::Yuv420));
+    assert!(e.is_err());
+}
+
+#[test]
 fn every_tool_round_trips() {
     let src = natural(4);
     let crop = |f: &Frame| {

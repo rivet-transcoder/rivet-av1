@@ -111,7 +111,8 @@ Frames are still decoded one after another; no frame-parallel decoding.
 
 ## What it encodes
 
-Profile 0 (8- or 10-bit 4:2:0), one temporal unit per frame, every frame
+Profile 0 (8- or 10-bit 4:2:0, or monochrome with `Config::monochrome` —
+as an AVIF alpha plane is coded), one temporal unit per frame, every frame
 shown, any size from 1x1 up (frames wider than 4096 are coded in the tile
 columns they need):
 

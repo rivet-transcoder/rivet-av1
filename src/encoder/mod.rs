@@ -91,6 +91,11 @@ pub struct Config {
     /// the alt-ref frame it has not paid on the encoder's test clips (+2 %
     /// BD-rate in groups of 8 at speed 4, ±0 at speed 6).
     pub altref: u32,
+    /// Luma only (`mono_chrome` = 1): the encoder takes
+    /// [`ChromaFormat::Mono`] frames and codes one plane. An AVIF alpha
+    /// plane is coded this way (AV1 Image File Format 4: an alpha item's
+    /// sequence header has `mono_chrome` = 1).
+    pub monochrome: bool,
 }
 
 /// The encoder's coding tools, each switchable (for measurement, or to
@@ -312,6 +317,7 @@ impl Config {
             tools: Tools::for_speed(DEFAULT_SPEED),
             threads: 1,
             altref: 0,
+            monochrome: false,
         }
     }
 }
@@ -471,8 +477,8 @@ impl Encoder {
             enable_restoration: cfg.tools.restoration,
             color: ColorConfig {
                 bit_depth: cfg.bit_depth,
-                mono_chrome: false,
-                num_planes: 3,
+                mono_chrome: cfg.monochrome,
+                num_planes: if cfg.monochrome { 1 } else { 3 },
                 color_primaries: cfg.color.color_primaries,
                 transfer_characteristics: cfg.color.transfer_characteristics,
                 matrix_coefficients: cfg.color.matrix_coefficients,
@@ -566,10 +572,17 @@ impl Encoder {
         if frame.width != cfg.width || frame.height != cfg.height {
             return Err(Error::invalid("frame size differs from the configuration"));
         }
-        if frame.bit_depth != cfg.bit_depth || frame.chroma != ChromaFormat::Yuv420 {
-            return Err(Error::invalid(
-                "the encoder takes 4:2:0 frames of the configured bit depth",
-            ));
+        let chroma = if cfg.monochrome {
+            ChromaFormat::Mono
+        } else {
+            ChromaFormat::Yuv420
+        };
+        if frame.bit_depth != cfg.bit_depth || frame.chroma != chroma {
+            return Err(Error::invalid(if cfg.monochrome {
+                "the encoder is configured monochrome: it takes luma-only frames of the configured bit depth"
+            } else {
+                "the encoder takes 4:2:0 frames of the configured bit depth"
+            }));
         }
         if cfg.bit_depth != 8 && cfg.bit_depth != 10 {
             return Err(Error::invalid("bit depth must be 8 or 10"));
@@ -1047,6 +1060,13 @@ impl Encoder {
             } else {
                 ((aw >> 1) + 32, (ah >> 1) + 32)
             };
+            if p >= frame.chroma.num_planes() {
+                // A monochrome frame: no chroma to code (the planes are
+                // never read), a flat one keeps the shape.
+                src.push(vec![1u16 << (frame.bit_depth - 1); sw * sh]);
+                stride.push(sw);
+                continue;
+            }
             let pl = frame.planes[p];
             let (w, h) = (pl.width as usize, pl.height as usize);
             let mut v = vec![0u16; sw * sh];
@@ -1270,8 +1290,11 @@ impl Encoder {
         // quantization_params()
         w.f(8, p.qidx);
         w.flag(false); // DeltaQYDc
-        w.flag(false); // DeltaQUDc
-        w.flag(false); // DeltaQUAc
+        let chroma = self.seq.color.num_planes > 1;
+        if chroma {
+            w.flag(false); // DeltaQUDc
+            w.flag(false); // DeltaQUAc
+        }
         w.flag(false); // using_qmatrix
         w.flag(false); // segmentation_enabled
         if p.qidx > 0 {
@@ -1284,7 +1307,7 @@ impl Encoder {
         // loop_filter_params()
         w.f(6, p.lf[0]);
         w.f(6, p.lf[1]);
-        if p.lf[0] != 0 || p.lf[1] != 0 {
+        if chroma && (p.lf[0] != 0 || p.lf[1] != 0) {
             w.f(6, p.lf[2]);
             w.f(6, p.lf[3]);
         }
@@ -1297,15 +1320,17 @@ impl Encoder {
             for i in 0..1usize << c.bits {
                 w.f(4, c.y[i].0);
                 w.f(2, c.y[i].1);
-                w.f(4, c.uv[i].0);
-                w.f(2, c.uv[i].1);
+                if chroma {
+                    w.f(4, c.uv[i].0);
+                    w.f(2, c.uv[i].1);
+                }
             }
         }
         // lr_params()
         if let Some(types) = &p.lr {
             let mut uses_lr = false;
             let mut uses_chroma_lr = false;
-            for (plane, &t) in types.iter().enumerate() {
+            for (plane, &t) in types.iter().enumerate().take(self.seq.color.num_planes) {
                 // The coded lr_type (the inverse of Remap_Lr_Type).
                 w.f(
                     2,
@@ -1441,6 +1466,7 @@ fn search_lf(
 ) -> [u32; 4] {
     let saved = f.cur.clone();
     let mut best = [(u64::MAX, 0u32); 3];
+    let planes = f.num_planes;
     for scale in [0.0, 0.5, 0.75, 1.0, 1.25, 1.5] {
         let lv = |l: u32| ((l as f64 * scale).round() as u32).min(63);
         let levels = [lv(start[0]), lv(start[1]), lv(start[2]), lv(start[3])];
@@ -1448,7 +1474,7 @@ fn search_lf(
         if levels[0] != 0 || levels[1] != 0 {
             crate::decoder::postfilter::loop_filter_threads(f, threads);
         }
-        for (p, b) in best.iter_mut().enumerate() {
+        for (p, b) in best.iter_mut().enumerate().take(planes) {
             let e = plane_sse(f, src, stride, p);
             if e < b.0 {
                 *b = (e, if p == 0 { levels[0] } else { levels[1 + p] });
