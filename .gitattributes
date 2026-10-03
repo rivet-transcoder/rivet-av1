@@ -1,0 +1,5 @@
+# Bash scripts, lists and manifests must check out with LF on every platform;
+# a core.autocrlf=true checkout otherwise breaks the vector list and MD5 files.
+* text=auto eol=lf
+*.ivf binary
+*.webm binary

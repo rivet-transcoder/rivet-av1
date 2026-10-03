@@ -1,0 +1,31 @@
+[package]
+name = "rivet-av1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license-file = "LICENSE.md"
+readme = "README.md"
+repository = "https://github.com/rivet-transcoder/rivet-av1"
+homepage = "https://github.com/rivet-transcoder/rivet-av1"
+documentation = "https://docs.rs/rivet-av1"
+authors = ["Ely Erin Fox"]
+description = "An AV1 decoder and encoder in Rust, written from the AV1 Bitstream & Decoding Process Specification: no C, no system libraries, no build script. Decodes OBU streams (IVF, Annex B-free low-overhead format) bit-exactly against the AOM test vectors; a key-frame and inter-frame encoder. rivet's AV1 codec. Imported as `av1`."
+keywords = ["av1", "video", "decoder", "encoder", "codec"]
+categories = ["multimedia::video", "multimedia::encoding"]
+exclude = [".github/", "tools/", "tests/vectors/"]
+
+[lib]
+name = "av1"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+md5 = "0.7"
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[features]
+default = []
+
+[profile.test]
+opt-level = 2
