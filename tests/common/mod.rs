@@ -139,6 +139,13 @@ pub fn run_vector(path: &Path) -> Outcome {
     let name = path.file_name().unwrap().to_string_lossy().to_string();
     let expected = expected_md5s(path);
     let mut dec = av1::Decoder::new();
+    // AV1_DECODE_THREADS runs the threaded decoder (tiles, post-filters).
+    if let Some(n) = std::env::var("AV1_DECODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        dec.set_threads(n);
+    }
     let mut frames = 0usize;
     let mut matched = 0usize;
     let mut failure = None;

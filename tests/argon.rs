@@ -121,6 +121,13 @@ fn cases(root: &Path) -> Vec<Case> {
 fn run(c: &Case) -> Result<bool, String> {
     let data = std::fs::read(&c.stream).map_err(|e| e.to_string())?;
     let mut dec = av1::Decoder::new();
+    // AV1_DECODE_THREADS runs the threaded decoder (tiles, post-filters).
+    if let Some(n) = std::env::var("AV1_DECODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        dec.set_threads(n);
+    }
     dec.set_operating_point(c.oppoint);
     let mut out = md5::Context::new();
     // Monochrome output as aomdec writes it with --rawvideo: we hash with

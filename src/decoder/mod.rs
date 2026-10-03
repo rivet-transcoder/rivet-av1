@@ -59,12 +59,12 @@ pub(crate) struct FrameCtx {
     pub(crate) lf_tx_sizes: [Vec<u8>; 3],
     pub(crate) palette_colors: [Vec<[u16; 8]>; 2],
     pub(crate) segment_ids: Vec<u8>,
-    pub(crate) prev_segment_ids: Vec<u8>,
+    pub(crate) prev_segment_ids: Arc<Vec<u8>>,
     pub(crate) cdef_idx: Vec<i8>,
     pub(crate) cdef_stride: usize,
     pub(crate) lr: [LrPlane; 3],
     /// `MotionFieldMvs[ ref ]` on the 8x8 grid.
-    pub(crate) motion_field: Vec<Vec<Mv>>,
+    pub(crate) motion_field: Arc<Vec<Vec<Mv>>>,
     pub(crate) cur: FrameBuf,
     pub(crate) refs: [Option<Arc<RefData>>; 8],
     /// The frame's CDFs (6.8.2).
@@ -80,6 +80,147 @@ pub(crate) struct FrameCtx {
 }
 
 impl FrameCtx {
+    /// A frame state for decoding one tile on its own: the frame's
+    /// parameters and references shared, its per-4x4 arrays and sample
+    /// buffers fresh (a tile reads nothing another tile of the same frame
+    /// writes). [`FrameCtx::merge_tile`] copies the tile back.
+    pub(crate) fn shard(&self) -> FrameCtx {
+        let n = self.mi.len();
+        FrameCtx {
+            seq: self.seq.clone(),
+            hdr: self.hdr.clone(),
+            bit_depth: self.bit_depth,
+            ssx: self.ssx,
+            ssy: self.ssy,
+            num_planes: self.num_planes,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            ms: self.ms,
+            mi: vec![Mi::default(); n],
+            tx_types: vec![0; n],
+            lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
+            palette_colors: [
+                vec![[0; 8]; self.palette_colors[0].len()],
+                vec![[0; 8]; self.palette_colors[1].len()],
+            ],
+            segment_ids: vec![0; n],
+            prev_segment_ids: self.prev_segment_ids.clone(),
+            cdef_idx: self.cdef_idx.clone(),
+            cdef_stride: self.cdef_stride,
+            lr: self.lr.clone(),
+            motion_field: self.motion_field.clone(),
+            cur: FrameBuf {
+                planes: self
+                    .cur
+                    .planes
+                    .iter()
+                    .map(|p| PlaneBuf::new(p.w, p.h, 0))
+                    .collect(),
+            },
+            refs: self.refs.clone(),
+            cdfs: self.cdfs.clone(),
+            saved_cdfs: None,
+            mask: Box::new([0; 128 * 128]),
+            tile_num: self.tile_num,
+            tiles_ok: true,
+        }
+    }
+
+    /// Copies what decoding tile (`tile_row`, `tile_col`) into `shard`
+    /// wrote back into this frame state: the tile's mode info, transform
+    /// sizes and types, segment ids, CDEF indices, loop restoration units
+    /// and samples (with the margins past the frame edge, for the last
+    /// tile row and column).
+    pub(crate) fn merge_tile(&mut self, shard: &FrameCtx, tile_row: usize, tile_col: usize) {
+        let ti = &self.hdr.tile_info;
+        let last_row = tile_row + 1 == ti.rows;
+        let last_col = tile_col + 1 == ti.cols;
+        let r0 = ti.mi_row_starts[tile_row];
+        let c0 = ti.mi_col_starts[tile_col];
+        let mr1 = ti.mi_row_starts[tile_row + 1];
+        let mc1 = ti.mi_col_starts[tile_col + 1];
+        let rows = self.mi_rows + 32;
+        let ms = self.ms;
+        let r1 = if last_row { rows } else { mr1 };
+        let c1 = if last_col { ms } else { mc1 };
+        for row in r0..r1 {
+            let a = row * ms + c0;
+            let b = row * ms + c1;
+            self.mi[a..b].copy_from_slice(&shard.mi[a..b]);
+            self.tx_types[a..b].copy_from_slice(&shard.tx_types[a..b]);
+            self.segment_ids[a..b].copy_from_slice(&shard.segment_ids[a..b]);
+        }
+        for p in 0..self.num_planes {
+            let (sx, sy) = self.plane_ss(p);
+            let pr1 = if last_row { rows } else { mr1 >> sy };
+            let pc1 = if last_col { ms } else { mc1 >> sx };
+            for row in (r0 >> sy)..pr1 {
+                let a = row * ms + (c0 >> sx);
+                let b = row * ms + pc1;
+                self.lf_tx_sizes[p][a..b].copy_from_slice(&shard.lf_tx_sizes[p][a..b]);
+            }
+            let dst = &mut self.cur.planes[p];
+            let src = &shard.cur.planes[p];
+            let x0 = (c0 * MI_SIZE) >> sx;
+            let x1 = if last_col {
+                dst.w
+            } else {
+                (mc1 * MI_SIZE) >> sx
+            };
+            let y0 = (r0 * MI_SIZE) >> sy;
+            let y1 = if last_row {
+                dst.h
+            } else {
+                (mr1 * MI_SIZE) >> sy
+            };
+            for y in y0..y1 {
+                let o = y * dst.stride;
+                dst.data[o + x0..o + x1].copy_from_slice(&src.data[o + x0..o + x1]);
+            }
+        }
+        // CDEF indices and loop restoration units, per superblock.
+        let sb4 = if self.seq.use_128x128_superblock {
+            32
+        } else {
+            16
+        };
+        let mut r = r0;
+        while r < mr1 {
+            let mut c = c0;
+            while c < mc1 {
+                let s = self.cdef_stride;
+                for (dr, dc) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    if (dr == 1 || dc == 1) && sb4 == 16 {
+                        continue;
+                    }
+                    let i = ((r >> 4) + dr) * s + (c >> 4) + dc;
+                    if i < self.cdef_idx.len() {
+                        self.cdef_idx[i] = shard.cdef_idx[i];
+                    }
+                }
+                for plane in 0..self.num_planes {
+                    if self.hdr.frame_restoration_type[plane] == RESTORE_NONE {
+                        continue;
+                    }
+                    let (units_r, units_c) = lr_units_of_sb(self, plane, r, c, sb4);
+                    let l = &mut self.lr[plane];
+                    let sl = &shard.lr[plane];
+                    for ur in units_r.clone() {
+                        for uc in units_c.clone() {
+                            let i = ur * l.unit_cols + uc;
+                            l.lr_type[i] = sl.lr_type[i];
+                            l.wiener[i] = sl.wiener[i];
+                            l.sgr_set[i] = sl.sgr_set[i];
+                            l.sgr_xqd[i] = sl.sgr_xqd[i];
+                        }
+                    }
+                }
+                c += sb4;
+            }
+            r += sb4;
+        }
+    }
+
     /// `get_plane_residual_size( subsize, plane )`.
     #[inline]
     pub(crate) fn plane_residual_size(&self, subsize: usize, plane: usize) -> usize {
@@ -118,6 +259,8 @@ pub struct Decoder {
     max_pixels: u64,
     /// The HDR metadata OBUs seen so far in this coded video sequence.
     hdr: HdrMetadata,
+    /// Worker threads for tiles and the post-filters (1: none).
+    threads: usize,
 }
 
 impl Default for Decoder {
@@ -140,6 +283,7 @@ impl Decoder {
             operating_point: 0,
             max_pixels: 1 << 26,
             hdr: HdrMetadata::default(),
+            threads: 1,
         }
     }
 
@@ -148,6 +292,17 @@ impl Decoder {
     /// pixels, admits AV1's largest level (8K).
     pub fn set_max_pixels(&mut self, max: u64) {
         self.max_pixels = max;
+    }
+
+    /// Decodes with up to `n` threads: the tiles of a frame in parallel
+    /// (when it has several) and the post-filters by rows. 1, the default,
+    /// decodes on the caller's thread alone; 0 means one per core.
+    pub fn set_threads(&mut self, n: usize) {
+        self.threads = if n == 0 {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        } else {
+            n
+        };
     }
 
     /// Makes the decoder report a tile whose arithmetic-coded data does not
@@ -388,6 +543,7 @@ impl Decoder {
             planes.push(PlaneBuf::new((aw >> ssx) + 32, (ah >> ssy) + 32, 0));
         }
         let cdef_stride = (mi_cols >> 4) + 2;
+        let screen_content = hdr.allow_screen_content_tools;
         let mut lr: [LrPlane; 3] = Default::default();
         for (plane, l) in lr.iter_mut().enumerate().take(num_planes) {
             if hdr.frame_restoration_type[plane] != RESTORE_NONE {
@@ -421,13 +577,18 @@ impl Decoder {
             mi: vec![Mi::default(); n],
             tx_types: vec![0; n],
             lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
-            palette_colors: [vec![[0; 8]; n], vec![[0; 8]; n]],
+            // Palettes need screen content tools.
+            palette_colors: if screen_content {
+                [vec![[0; 8]; n], vec![[0; 8]; n]]
+            } else {
+                [Vec::new(), Vec::new()]
+            },
             segment_ids: vec![0; n],
-            prev_segment_ids,
+            prev_segment_ids: Arc::new(prev_segment_ids),
             cdef_idx: vec![-1; cdef_stride * ((mi_rows >> 4) + 2)],
             cdef_stride,
             lr,
-            motion_field: Vec::new(),
+            motion_field: Arc::new(Vec::new()),
             cur: FrameBuf { planes },
             refs: self.refs.clone(),
             cdfs,
@@ -439,7 +600,7 @@ impl Decoder {
         if f.hdr.use_ref_frame_mvs {
             self.motion_field_estimation(&mut f);
         } else {
-            f.motion_field = vec![Vec::new(); 8];
+            f.motion_field = Arc::new(vec![Vec::new(); 8]);
         }
         Ok(f)
     }
@@ -465,9 +626,8 @@ impl Decoder {
         }
         r.byte_align()?;
         let mut pos = r.position() / 8;
+        let mut tile_data = Vec::with_capacity(tg_end + 1 - tg_start);
         for tile_num in tg_start..=tg_end {
-            let tile_row = tile_num / ti.cols;
-            let tile_col = tile_num % ti.cols;
             let last = tile_num == tg_end;
             let tile_size = if last {
                 data.len() - pos
@@ -486,21 +646,46 @@ impl Decoder {
             if pos + tile_size > data.len() {
                 return Err(Error::bitstream("tile data runs past the tile group"));
             }
-            let tile_data = &data[pos..pos + tile_size];
+            tile_data.push((tile_num, &data[pos..pos + tile_size]));
             pos += tile_size;
-            let (ok, saved) = {
-                let mut td = TileDecoder::new(f, tile_data, tile_row, tile_col);
-                td.decode_tile()?;
-                let ok = td.sd.trailing_ok();
-                let saved = if !td.f.hdr.disable_frame_end_update_cdf
-                    && tile_num == ti.context_update_tile_id
-                {
-                    Some(td.cdf)
-                } else {
-                    None
-                };
-                (ok, saved)
+        }
+        let threads = self.threads.min(tile_data.len());
+        // Each tile: whether its padding checked out, and its CDFs when it is
+        // the one whose CDFs the frame keeps.
+        type TileResult = Result<(bool, Option<Box<CdfContext>>)>;
+        let decode_one = |f: &mut FrameCtx, tile_num: usize, d: &[u8]| -> TileResult {
+            let mut td = TileDecoder::new(f, d, tile_num / ti.cols, tile_num % ti.cols);
+            td.decode_tile()?;
+            let ok = td.sd.trailing_ok();
+            let saved = if !td.f.hdr.disable_frame_end_update_cdf
+                && tile_num == ti.context_update_tile_id
+            {
+                Some(td.cdf)
+            } else {
+                None
             };
+            Ok((ok, saved))
+        };
+        let results: Vec<(usize, TileResult)> = if threads > 1 {
+            let nums: Vec<usize> = tile_data.iter().map(|t| t.0).collect();
+            tiles_in_parallel(f, &nums, threads, |shard, i| {
+                let (tile_num, d) = tile_data[i];
+                (tile_num, decode_one(shard, tile_num, d))
+            })
+        } else {
+            let mut out = Vec::new();
+            for &(tile_num, d) in &tile_data {
+                let r = decode_one(f, tile_num, d);
+                let stop = r.is_err();
+                out.push((tile_num, r));
+                if stop {
+                    break;
+                }
+            }
+            out
+        };
+        for (tile_num, r) in results {
+            let (ok, saved) = r?;
             if !ok {
                 f.tiles_ok = false;
                 if self.strict {
@@ -538,20 +723,21 @@ impl Decoder {
     /// The decode frame wrapup process (7.4) for a decoded frame.
     fn decode_frame_wrapup(&mut self, mut f: FrameCtx) -> Result<()> {
         if f.hdr.loop_filter_level[0] != 0 || f.hdr.loop_filter_level[1] != 0 {
-            postfilter::loop_filter(&mut f);
+            postfilter::loop_filter_threads(&mut f, self.threads);
         }
-        let cdef = postfilter::cdef(&f);
+        let cdef = postfilter::cdef(&f, self.threads);
         let up_cdef = match postfilter::upscale(&f, &cdef) {
             Some(u) => u,
             None => cdef,
         };
         let up_cur_owned = postfilter::upscale(&f, &f.cur);
         let up_cur = up_cur_owned.as_ref().unwrap_or(&f.cur);
-        let lr = postfilter::loop_restoration(&f, up_cur, up_cdef);
+        let lr = postfilter::loop_restoration(&f, up_cur, up_cdef, self.threads);
         drop(up_cur_owned);
         let (mf_ref_frames, mf_mvs) = self.motion_vector_storage(&f);
         if f.hdr.segmentation_enabled && !f.hdr.segmentation_update_map {
-            f.segment_ids.copy_from_slice(&f.prev_segment_ids);
+            let prev = f.prev_segment_ids.clone();
+            f.segment_ids.copy_from_slice(&prev);
         }
         let seq = f.seq.clone();
         let h = &f.hdr;
@@ -696,7 +882,7 @@ impl Decoder {
         let w8 = f.mi_cols >> 1;
         let h8 = f.mi_rows >> 1;
         let invalid: Mv = [-1 << 15, -1 << 15];
-        f.motion_field = vec![vec![invalid; w8 * h8]; 8];
+        f.motion_field = Arc::new(vec![vec![invalid; w8 * h8]; 8]);
         let seq = f.seq.clone();
         let h = f.hdr.clone();
         let last_idx = h.ref_frame_idx[0];
@@ -776,7 +962,8 @@ impl Decoder {
                     for dst in LAST_FRAME..=ALTREF_FRAME {
                         let ref_to_dst = dist(order_hint, order_hints[dst as usize]);
                         let p = get_mv_projection(mv, ref_to_dst, ref_offset);
-                        f.motion_field[dst as usize][(pos_y8 * w8 + pos_x8) as usize] = p;
+                        Arc::make_mut(&mut f.motion_field)[dst as usize]
+                            [(pos_y8 * w8 + pos_x8) as usize] = p;
                     }
                 }
             }
@@ -830,6 +1017,114 @@ fn color_info(c: &crate::obu::ColorConfig) -> ColorInfo {
         full_range: c.color_range,
         chroma_sample_position: c.chroma_sample_position,
     }
+}
+
+/// The loop restoration units superblock `(r, c)` codes (5.11.57):
+/// unit rows and columns.
+pub(crate) fn lr_units_of_sb(
+    f: &FrameCtx,
+    plane: usize,
+    r: usize,
+    c: usize,
+    sb4: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let (sub_x, sub_y) = f.plane_ss(plane);
+    let unit_size = f.hdr.loop_restoration_size[plane];
+    let l = &f.lr[plane];
+    let row_start = (r * (MI_SIZE >> sub_y)).div_ceil(unit_size);
+    let row_end = l
+        .unit_rows
+        .min(((r + sb4) * (MI_SIZE >> sub_y)).div_ceil(unit_size));
+    let (numerator, denominator) = if f.hdr.use_superres {
+        (
+            (MI_SIZE >> sub_x) * f.hdr.superres_denom as usize,
+            unit_size * SUPERRES_NUM as usize,
+        )
+    } else {
+        (MI_SIZE >> sub_x, unit_size)
+    };
+    let col_start = (c * numerator).div_ceil(denominator);
+    let col_end = l
+        .unit_cols
+        .min(((c + sb4) * numerator).div_ceil(denominator));
+    (row_start..row_end, col_start..col_end)
+}
+
+/// Codes (or decodes) the tiles `tiles` of frame `f` on up to `threads`
+/// threads: `job(state, i)` handles `tiles[i]` in a frame state of the
+/// worker's own (`FrameCtx::shard`), whose tile region is then copied into
+/// `f`. The tiles of a frame are independent, so the result is the same as
+/// handling them one after the other in `f`.
+pub(crate) fn tiles_in_parallel<T: Send>(
+    f: &mut FrameCtx,
+    tiles: &[usize],
+    threads: usize,
+    job: impl Fn(&mut FrameCtx, usize) -> T + Sync,
+) -> Vec<T> {
+    let cols = f.hdr.tile_info.cols;
+    let workers = threads.min(tiles.len()).max(1);
+    let shards: Vec<FrameCtx> = (0..workers).map(|_| f.shard()).collect();
+    let main = std::sync::Mutex::new(f);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<T>>> =
+        tiles.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for mut shard in shards {
+            let (main, next, out, job) = (&main, &next, &out, &job);
+            s.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= tiles.len() {
+                        break;
+                    }
+                    let r = job(&mut shard, i);
+                    let t = tiles[i];
+                    main.lock()
+                        .expect("frame state")
+                        .merge_tile(&shard, t / cols, t % cols);
+                    *out[i].lock().expect("result slot") = Some(r);
+                }
+            });
+        }
+    });
+    out.into_iter()
+        .map(|m| {
+            m.into_inner()
+                .expect("result slot")
+                .expect("every tile ran")
+        })
+        .collect()
+}
+
+/// Runs `job(i)` for `i` in `0..n` on up to `threads` threads (the
+/// caller's among them), returning the results in order.
+pub(crate) fn parallel_map<T: Send>(
+    n: usize,
+    threads: usize,
+    job: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<T>>> =
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let v = job(i);
+            *out[i].lock().expect("result slot") = Some(v);
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 1..threads.min(n) {
+            s.spawn(work);
+        }
+        work();
+    });
+    out.into_iter()
+        .map(|m| m.into_inner().expect("result slot").expect("every job ran"))
+        .collect()
 }
 
 /// `leb128()` at the start of `d`: the value and its length in bytes.

@@ -12,29 +12,110 @@ use crate::tables::*;
 // Loop filter (7.14)
 // ---------------------------------------------------------------------------
 
+/// A plane's samples written by several threads at once, each to a part
+/// no other thread reads or writes (rows or columns, as the caller
+/// arranges).
+#[derive(Clone, Copy)]
+pub(crate) struct SharedPlane {
+    ptr: *mut u16,
+    len: usize,
+    pub(crate) stride: usize,
+}
+
+// SAFETY: the threads sharing a `SharedPlane` touch disjoint samples (see
+// each user), and the plane outlives them (scoped threads).
+unsafe impl Send for SharedPlane {}
+unsafe impl Sync for SharedPlane {}
+
+impl SharedPlane {
+    pub(crate) fn new(p: &mut PlaneBuf) -> Self {
+        SharedPlane {
+            ptr: p.data.as_mut_ptr(),
+            len: p.data.len(),
+            stride: p.stride,
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, i: usize) -> u16 {
+        assert!(i < self.len);
+        // SAFETY: in bounds; no other thread writes this sample.
+        unsafe { *self.ptr.add(i) }
+    }
+
+    #[inline(always)]
+    fn set(&self, i: usize, v: u16) {
+        assert!(i < self.len);
+        // SAFETY: in bounds; no other thread reads or writes this sample.
+        unsafe { *self.ptr.add(i) = v }
+    }
+
+    /// Row `y`, `x0..x0 + n`, written from `src`.
+    #[inline]
+    pub(crate) fn write_row(&self, x0: usize, y: usize, src: &[u16]) {
+        let o = y * self.stride + x0;
+        assert!(o + src.len() <= self.len);
+        // SAFETY: in bounds; no other thread reads or writes these samples.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(o), src.len()) }
+    }
+}
+
 /// The loop filter process (7.14.1), in place on `CurrFrame`.
 pub(crate) fn loop_filter(f: &mut FrameCtx) {
+    loop_filter_threads(f, 1);
+}
+
+/// The loop filter process on up to `threads` threads. The first pass
+/// (vertical edges) filters along rows, so bands of rows are independent;
+/// the second (horizontal edges) along columns, so bands of columns are.
+pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
     for plane in 0..f.num_planes {
         if plane == 0 || f.hdr.loop_filter_level[1 + plane] != 0 {
+            let mut pb = std::mem::take(&mut f.cur.planes[plane]);
+            let sp = SharedPlane::new(&mut pb);
+            let fr: &FrameCtx = f;
+            let row_step = if plane == 0 { 1 } else { 1 << fr.ssy };
+            let col_step = if plane == 0 { 1 } else { 1 << fr.ssx };
             for pass in 0..2 {
-                let row_step = if plane == 0 { 1 } else { 1 << f.ssy };
-                let col_step = if plane == 0 { 1 } else { 1 << f.ssx };
-                let mut row = 0;
-                while row < f.mi_rows {
-                    let mut col = 0;
-                    while col < f.mi_cols {
-                        edge_loop_filter(f, plane, pass, row, col);
-                        col += col_step;
+                // Bands of 16 mode info units (64 luma samples).
+                let extent = if pass == 0 { fr.mi_rows } else { fr.mi_cols };
+                let bands = extent.div_ceil(16);
+                let band = |b: usize| {
+                    let (r0, r1, c0, c1) = if pass == 0 {
+                        (b * 16, ((b + 1) * 16).min(fr.mi_rows), 0, fr.mi_cols)
+                    } else {
+                        (0, fr.mi_rows, b * 16, ((b + 1) * 16).min(fr.mi_cols))
+                    };
+                    let mut row = r0;
+                    while row < r1 {
+                        let mut col = c0;
+                        while col < c1 {
+                            edge_loop_filter(fr, sp, plane, pass, row, col);
+                            col += col_step;
+                        }
+                        row += row_step;
                     }
-                    row += row_step;
+                };
+                if threads > 1 {
+                    crate::decoder::parallel_map(bands, threads, band);
+                } else {
+                    (0..bands).for_each(band);
                 }
             }
+            f.cur.planes[plane] = pb;
         }
     }
 }
 
 /// The edge loop filter process (7.14.2).
-fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col: usize) {
+fn edge_loop_filter(
+    f: &FrameCtx,
+    p: SharedPlane,
+    plane: usize,
+    pass: usize,
+    row: usize,
+    col: usize,
+) {
     let (sub_x, sub_y) = f.plane_ss(plane);
     let (dx, dy) = if pass == 0 { (1i32, 0i32) } else { (0, 1) };
     let x = col * MI_SIZE;
@@ -72,6 +153,9 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
         yp.is_multiple_of(TX_HEIGHT[tx_sz])
     };
     let apply_filter = is_tx_edge && (is_block_edge || !skip || is_intra);
+    if !apply_filter {
+        return;
+    }
     // The filter size process (7.14.3).
     let base_size = if pass == 0 {
         TX_WIDTH[prev_tx_sz].min(TX_WIDTH[tx_sz])
@@ -87,11 +171,10 @@ fn edge_loop_filter(f: &mut FrameCtx, plane: usize, pass: usize, row: usize, col
     if lvl == 0 {
         (lvl, limit, blimit, thresh) = filter_strength(f, prev_row, prev_col, plane, pass);
     }
-    if !(apply_filter && lvl > 0) {
+    if lvl == 0 {
         return;
     }
     let bd = f.bit_depth;
-    let p = &mut f.cur.planes[plane];
     for i in 0..MI_SIZE as i32 {
         sample_filter(
             p,
@@ -173,7 +256,7 @@ fn filter_strength(
 /// The sample filtering process (7.14.6).
 #[allow(clippy::too_many_arguments)]
 fn sample_filter(
-    p: &mut PlaneBuf,
+    p: SharedPlane,
     x: i32,
     y: i32,
     plane: usize,
@@ -188,15 +271,15 @@ fn sample_filter(
     let stride = p.stride as isize;
     let base = y as isize * stride + x as isize;
     let step = dy as isize * stride + dx as isize;
-    let s = |p: &PlaneBuf, k: isize| p.data[(base + k * step) as usize] as i32;
-    let q0 = s(p, 0);
-    let q1 = s(p, 1);
-    let q2 = s(p, 2);
-    let q3 = s(p, 3);
-    let p0 = s(p, -1);
-    let p1 = s(p, -2);
-    let p2 = s(p, -3);
-    let p3 = s(p, -4);
+    // The samples across the edge: v[7 + k] is the k-th from it (q0 at 7,
+    // p0 at 6).
+    let reach: isize = if filter_size >= 16 { 7 } else { 4 };
+    let mut v = [0i32; 14];
+    for k in -reach..reach {
+        v[(7 + k) as usize] = p.get((base + k * step) as usize) as i32;
+    }
+    let (q0, q1, q2, q3) = (v[7], v[8], v[9], v[10]);
+    let (p0, p1, p2, p3) = (v[6], v[5], v[4], v[3]);
     // The filter mask process (7.14.6.2).
     let sh = bd - 8;
     let thresh_bd = thresh << sh;
@@ -238,12 +321,8 @@ fn sample_filter(
     }
     let mut flat_mask2 = false;
     if filter_size >= 16 {
-        let q4 = s(p, 4);
-        let q5 = s(p, 5);
-        let q6 = s(p, 6);
-        let p4 = s(p, -5);
-        let p5 = s(p, -6);
-        let p6 = s(p, -7);
+        let (q4, q5, q6) = (v[11], v[12], v[13]);
+        let (p4, p5, p6) = (v[2], v[1], v[0]);
         let m = (p6 - p0).abs() > threshold_bd
             || (q6 - q0).abs() > threshold_bd
             || (p5 - p0).abs() > threshold_bd
@@ -252,6 +331,7 @@ fn sample_filter(
             || (q4 - q0).abs() > threshold_bd;
         flat_mask2 = !m;
     }
+    let set = |k: isize, val: i32| p.set((base + k * step) as usize, val as u16);
     if filter_size == 4 || !flat_mask {
         // The narrow filter process (7.14.6.3).
         let lo = -(1 << (bd - 1));
@@ -266,14 +346,12 @@ fn sample_filter(
         filter = c(filter + 3 * (qs0 - ps0));
         let filter1 = c(filter + 4) >> 3;
         let filter2 = c(filter + 3) >> 3;
-        let set =
-            |p: &mut PlaneBuf, k: isize, v: i32| p.data[(base + k * step) as usize] = v as u16;
-        set(p, 0, c(qs0 - filter1) + off);
-        set(p, -1, c(ps0 + filter2) + off);
+        set(0, c(qs0 - filter1) + off);
+        set(-1, c(ps0 + filter2) + off);
         if !hev_mask {
             let filter = round2(filter1, 1);
-            set(p, 1, c(qs1 - filter) + off);
-            set(p, -2, c(ps1 + filter) + off);
+            set(1, c(qs1 - filter) + off);
+            set(-2, c(ps1 + filter) + off);
         }
     } else {
         // The wide filter process (7.14.6.4).
@@ -296,12 +374,12 @@ fn sample_filter(
             for j in -n..=n {
                 let pp = (i + j).clamp(-(n + 1), n);
                 let tap = if j.abs() <= n2 { 2 } else { 1 };
-                t += s(p, pp) * tap;
+                t += v[(7 + pp) as usize] * tap;
             }
             fv[(i + n) as usize] = round2(t, log2_size);
         }
         for i in -n..n {
-            p.data[(base + i * step) as usize] = fv[(i + n) as usize] as u16;
+            set(i, fv[(i + n) as usize]);
         }
     }
 }
@@ -310,30 +388,41 @@ fn sample_filter(
 // CDEF (7.15)
 // ---------------------------------------------------------------------------
 
-/// The CDEF process (7.15): `CdefFrame` from `CurrFrame`.
-pub(crate) fn cdef(f: &FrameCtx) -> FrameBuf {
+/// The CDEF process (7.15): `CdefFrame` from `CurrFrame`, on up to
+/// `threads` threads (bands of 64 luma rows: each 8x8 block writes only its
+/// own samples).
+pub(crate) fn cdef(f: &FrameCtx, threads: usize) -> FrameBuf {
     let mut out = f.cur.clone();
     let h = &f.hdr;
     if h.coded_lossless || h.allow_intrabc || !f.seq.enable_cdef {
         return out;
     }
-    let mut r = 0;
-    while r < f.mi_rows {
-        let mut c = 0;
-        while c < f.mi_cols {
-            let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
-            if idx >= 0 {
-                cdef_block(f, &mut out, r, c, idx as usize);
+    let planes: Vec<SharedPlane> = out.planes.iter_mut().map(SharedPlane::new).collect();
+    let band = |b: usize| {
+        let mut r = b * 16;
+        while r < ((b + 1) * 16).min(f.mi_rows) {
+            let mut c = 0;
+            while c < f.mi_cols {
+                let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
+                if idx >= 0 {
+                    cdef_block(f, &planes, r, c, idx as usize);
+                }
+                c += 2;
             }
-            c += 2;
+            r += 2;
         }
-        r += 2;
+    };
+    let bands = f.mi_rows.div_ceil(16);
+    if threads > 1 {
+        crate::decoder::parallel_map(bands, threads, band);
+    } else {
+        (0..bands).for_each(band);
     }
     out
 }
 
 /// The CDEF block process (7.15.1) for a block whose parameters are set.
-fn cdef_block(f: &FrameCtx, out: &mut FrameBuf, r: usize, c: usize, idx: usize) {
+fn cdef_block(f: &FrameCtx, out: &[SharedPlane], r: usize, c: usize, idx: usize) {
     let cols = f.ms;
     let sk = |rr: usize, cc: usize| f.mi[rr * cols + cc].skip;
     let skip = sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1);
@@ -436,7 +525,7 @@ pub(crate) fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
 #[allow(clippy::too_many_arguments)]
 fn cdef_filter(
     f: &FrameCtx,
-    out: &mut FrameBuf,
+    out: &[SharedPlane],
     plane: usize,
     r: usize,
     c: usize,
@@ -468,15 +557,10 @@ fn cdef_filter(
         f.bit_depth - 8,
         &mut res,
     );
-    let dst = &mut out.planes[plane];
     for i in 0..h {
-        let o = (y0 + i) * dst.stride + x0;
-        dst.data[o..o + w].copy_from_slice(&res[i * w..(i + 1) * w]);
+        out[plane].write_row(x0, y0 + i, &res[i * w..(i + 1) * w]);
     }
 }
-
-/// A sample outside the frame: not a CDEF tap (`CdefAvailable` is 0).
-const CDEF_NA: i32 = i32::MIN;
 
 /// The CDEF filter process (7.15.3) of one `w` x `h` block of a plane at
 /// `(x0, y0)`, reading `src` (samples at or beyond `xlim` / `ylim`, the
@@ -499,33 +583,36 @@ pub(crate) fn cdef_filter_block(
     res: &mut [u16; 64],
 ) {
     // The block with a border of 2, unavailable samples marked.
+    use crate::dsp::cdef::{NA, Taps, WS};
     const B: usize = 2;
-    const WS: usize = 8 + 2 * B;
-    let mut win = [CDEF_NA; WS * WS];
+    let mut win = [NA; WS * WS];
+    let inside_x = x0 >= B && x0 + w + B <= xlim;
     for i in 0..h + 2 * B {
         let y = y0 as isize + i as isize - B as isize;
         if y < 0 || y as usize >= ylim {
             continue;
         }
         let row = &src.data[y as usize * src.stride..];
-        for j in 0..w + 2 * B {
-            let x = x0 as isize + j as isize - B as isize;
-            if x >= 0 && (x as usize) < xlim {
-                win[i * WS + j] = row[x as usize] as i32;
+        let out = &mut win[i * WS..i * WS + w + 2 * B];
+        if inside_x {
+            for (o, &v) in out.iter_mut().zip(&row[x0 - B..x0 + w + B]) {
+                *o = v as i32;
+            }
+        } else {
+            for (j, o) in out.iter_mut().enumerate() {
+                let x = x0 as isize + j as isize - B as isize;
+                if x >= 0 && (x as usize) < xlim {
+                    *o = row[x as usize] as i32;
+                }
             }
         }
     }
-    let pri_taps = &CDEF_PRI_TAPS[((pri_str >> coeff_shift) & 1) as usize];
-    let sec_taps = &CDEF_SEC_TAPS[((pri_str >> coeff_shift) & 1) as usize];
-    let pri_adj = if pri_str != 0 {
-        (damping - floor_log2(pri_str as u32) as i32).max(0)
-    } else {
-        0
-    };
-    let sec_adj = if sec_str != 0 {
-        (damping - floor_log2(sec_str as u32) as i32).max(0)
-    } else {
-        0
+    let adj = |s: i32| {
+        if s != 0 {
+            (damping - floor_log2(s as u32) as i32).max(0)
+        } else {
+            0
+        }
     };
     // Window offsets of the taps: primary (k, +/-), secondary (k, +/-, -2/+2).
     let off = |d: usize, k: usize| -> isize {
@@ -533,46 +620,17 @@ pub(crate) fn cdef_filter_block(
     };
     let d_lo = (dir + 6) & 7;
     let d_hi = (dir + 2) & 7;
-    let pri_off = [off(dir, 0), off(dir, 1)];
-    let sec_off = [[off(d_lo, 0), off(d_hi, 0)], [off(d_lo, 1), off(d_hi, 1)]];
-    #[inline(always)]
-    fn constrain_adj(diff: i32, threshold: i32, adj: i32) -> i32 {
-        let mag = diff.abs().min((threshold - (diff.abs() >> adj)).max(0));
-        if diff < 0 { -mag } else { mag }
-    }
-    for i in 0..h {
-        for j in 0..w {
-            let ci = ((i + B) * WS + j + B) as isize;
-            let x = win[ci as usize];
-            let mut sum = 0i32;
-            let mut max = x;
-            let mut min = x;
-            for k in 0..2 {
-                for sign in [-1isize, 1] {
-                    let p = win[(ci + sign * pri_off[k]) as usize];
-                    if p != CDEF_NA {
-                        if pri_str != 0 {
-                            sum += pri_taps[k] * constrain_adj(p - x, pri_str, pri_adj);
-                        }
-                        max = max.max(p);
-                        min = min.min(p);
-                    }
-                    for so in sec_off[k] {
-                        let s = win[(ci + sign * so) as usize];
-                        if s != CDEF_NA {
-                            if sec_str != 0 {
-                                sum += sec_taps[k] * constrain_adj(s - x, sec_str, sec_adj);
-                            }
-                            max = max.max(s);
-                            min = min.min(s);
-                        }
-                    }
-                }
-            }
-            let v = x + ((8 + sum - (sum < 0) as i32) >> 4);
-            res[i * w + j] = v.clamp(min, max) as u16;
-        }
-    }
+    let taps = Taps {
+        pri_str,
+        sec_str,
+        pri_adj: adj(pri_str),
+        sec_adj: adj(sec_str),
+        pri_taps: CDEF_PRI_TAPS[((pri_str >> coeff_shift) & 1) as usize],
+        sec_taps: CDEF_SEC_TAPS[((pri_str >> coeff_shift) & 1) as usize],
+        pri_off: [off(dir, 0), off(dir, 1)],
+        sec_off: [[off(d_lo, 0), off(d_hi, 0)], [off(d_lo, 1), off(d_hi, 1)]],
+    };
+    crate::dsp::cdef::filter(&win, w, h, &taps, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -660,32 +718,49 @@ impl LrCtx<'_> {
 }
 
 /// The loop restoration process (7.17): `LrFrame` from `UpscaledCurrFrame`
-/// and `UpscaledCdefFrame` (taken: it is the starting point of `LrFrame`).
-pub(crate) fn loop_restoration(f: &FrameCtx, cur: &FrameBuf, cdef: FrameBuf) -> FrameBuf {
+/// and `UpscaledCdefFrame` (taken: it is the starting point of `LrFrame`),
+/// on up to `threads` threads (bands of 64 luma rows: each block writes
+/// only its own samples).
+pub(crate) fn loop_restoration(
+    f: &FrameCtx,
+    cur: &FrameBuf,
+    cdef: FrameBuf,
+    threads: usize,
+) -> FrameBuf {
     if !f.hdr.uses_lr {
         return cdef;
     }
     let mut lr = cdef.clone();
-    let mut y = 0;
-    while y < f.hdr.frame_height as usize {
-        let mut x = 0;
-        while x < f.hdr.upscaled_width as usize {
-            for plane in 0..f.num_planes {
-                if f.hdr.frame_restoration_type[plane] != RESTORE_NONE {
-                    loop_restore_block(
-                        f,
-                        cur,
-                        &cdef,
-                        &mut lr,
-                        plane,
-                        y >> MI_SIZE_LOG2,
-                        x >> MI_SIZE_LOG2,
-                    );
+    let planes: Vec<SharedPlane> = lr.planes.iter_mut().map(SharedPlane::new).collect();
+    let height = f.hdr.frame_height as usize;
+    let band = |b: usize| {
+        let mut y = b * 64;
+        while y < ((b + 1) * 64).min(height) {
+            let mut x = 0;
+            while x < f.hdr.upscaled_width as usize {
+                for plane in 0..f.num_planes {
+                    if f.hdr.frame_restoration_type[plane] != RESTORE_NONE {
+                        loop_restore_block(
+                            f,
+                            cur,
+                            &cdef,
+                            planes[plane],
+                            plane,
+                            y >> MI_SIZE_LOG2,
+                            x >> MI_SIZE_LOG2,
+                        );
+                    }
                 }
+                x += MI_SIZE;
             }
-            x += MI_SIZE;
+            y += MI_SIZE;
         }
-        y += MI_SIZE;
+    };
+    let bands = height.div_ceil(64);
+    if threads > 1 {
+        crate::decoder::parallel_map(bands, threads, band);
+    } else {
+        (0..bands).for_each(band);
     }
     lr
 }
@@ -695,7 +770,7 @@ fn loop_restore_block(
     f: &FrameCtx,
     cur: &FrameBuf,
     cdef: &FrameBuf,
-    lr: &mut FrameBuf,
+    out: SharedPlane,
     plane: usize,
     row: usize,
     col: usize,
@@ -737,7 +812,7 @@ fn loop_restore_block(
         plane_end_y,
     };
     let maxv = (1i32 << f.bit_depth) - 1;
-    let out = &mut lr.planes[plane];
+    let put = |x: usize, y: usize, v: u16| out.set(y * out.stride + x, v);
     if r_type == RESTORE_WIENER {
         let rv = f.rounding_variables(false);
         let vfilter = wiener_coefficient(&lp.wiener[uidx][0]);
@@ -763,7 +838,7 @@ fn loop_restore_block(
                     s += vfilter[t] * inter[r + t][c];
                 }
                 let v = round2(s, rv.round1);
-                out.set(x as usize + c, y as usize + r, v.clamp(0, maxv) as u16);
+                put(x as usize + c, y as usize + r, v.clamp(0, maxv) as u16);
             }
         }
     } else if r_type == RESTORE_SGRPROJ {
@@ -782,7 +857,7 @@ fn loop_restore_block(
                 v += if r0 != 0 { w0 * flt0[i][j] } else { w0 * u };
                 v += if r1 != 0 { w2 * flt1[i][j] } else { w2 * u };
                 let s = round2(v, (SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS) as u32);
-                out.set(x as usize + j, y as usize + i, s.clamp(0, maxv) as u16);
+                put(x as usize + j, y as usize + i, s.clamp(0, maxv) as u16);
             }
         }
     }

@@ -146,6 +146,8 @@ pub(crate) struct TileDecoder<'a, 'b> {
     pub(crate) dequant: Box<[i32; 64 * 64]>,
     pub(crate) residual: Box<[i32; 64 * 64]>,
     pub(crate) plane_tx_type: usize,
+    /// Inter prediction's `preds`, kept between blocks.
+    pub(crate) pred_bufs: [Vec<i32>; 2],
 }
 
 impl<'a, 'b> TileDecoder<'a, 'b> {
@@ -213,6 +215,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             dequant: Box::new([0; 64 * 64]),
             residual: Box::new([0; 64 * 64]),
             plane_tx_type: 0,
+            pred_bufs: [Vec::new(), Vec::new()],
         }
     }
 
@@ -323,31 +326,14 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         if self.f.hdr.allow_intrabc {
             return;
         }
-        let w = NUM_4X4_BLOCKS_WIDE[b_size];
-        let h = NUM_4X4_BLOCKS_HIGH[b_size];
         for plane in 0..self.f.num_planes {
             if self.f.hdr.frame_restoration_type[plane] == RESTORE_NONE {
                 continue;
             }
-            let sub_x = if plane == 0 { 0 } else { self.ssx() };
-            let sub_y = if plane == 0 { 0 } else { self.ssy() };
-            let unit_size = self.f.hdr.loop_restoration_size[plane];
-            let unit_rows = self.f.lr[plane].unit_rows;
-            let unit_cols = self.f.lr[plane].unit_cols;
-            let unit_row_start = (r * (MI_SIZE >> sub_y)).div_ceil(unit_size);
-            let unit_row_end = unit_rows.min(((r + h) * (MI_SIZE >> sub_y)).div_ceil(unit_size));
-            let (numerator, denominator) = if self.f.hdr.use_superres {
-                (
-                    (MI_SIZE >> sub_x) * self.f.hdr.superres_denom as usize,
-                    unit_size * SUPERRES_NUM as usize,
-                )
-            } else {
-                (MI_SIZE >> sub_x, unit_size)
-            };
-            let unit_col_start = (c * numerator).div_ceil(denominator);
-            let unit_col_end = unit_cols.min(((c + w) * numerator).div_ceil(denominator));
-            for unit_row in unit_row_start..unit_row_end {
-                for unit_col in unit_col_start..unit_col_end {
+            let (rows, cols) =
+                crate::decoder::lr_units_of_sb(self.f, plane, r, c, NUM_4X4_BLOCKS_WIDE[b_size]);
+            for unit_row in rows {
+                for unit_col in cols.clone() {
                     self.read_lr_unit(plane, unit_row, unit_col);
                 }
             }
