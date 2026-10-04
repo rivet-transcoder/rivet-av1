@@ -351,7 +351,7 @@ Not there yet:
   decoded in debug builds (overflow checks on) — errors, never a panic.
 - **SIMD**: each SIMD kernel (CDEF, the interpolation filters, the inverse
   transforms, the loop filter) against its scalar version on random input,
-  on x86-64 (AVX2) and on the aarch64 CI runners (NEON); `AV1_NO_SIMD=1`
+  on x86-64 (AVX2) in CI and on aarch64 (NEON) by hand (below); `AV1_NO_SIMD=1`
   turns the SIMD versions off. The test vectors and the Argon suite are
   run with the decoder's threads on (`AV1_DECODE_THREADS`).
 - **Units**: the arithmetic encoder against the decoder over random symbol
@@ -359,6 +359,19 @@ Not there yet:
   forward transforms round-tripping through the normative inverse; the
   inverse DCT on DC-only blocks; the Walsh-Hadamard transform; bit and
   IVF round trips.
+
+### NEON on ARM hardware
+
+CI runs on x86-64 Linux only, so the NEON (aarch64) code paths are not tested
+there. They are verified by hand on ARM hardware (an aarch64 Linux machine,
+or Apple silicon) after a change to them and before a release:
+
+```sh
+cargo test --release
+```
+
+The kernel tests compare each NEON kernel with its scalar version on random
+input, so the one run covers both.
 
 ## Provenance and licensing
 
