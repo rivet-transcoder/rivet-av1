@@ -2,7 +2,7 @@
 //! MP4) `runs` times and reports megapixels a second (shown frames times
 //! their size, over the wall time of the decode calls alone).
 //!
-//! cargo run --release --example decbench -- input.{ivf,mp4} [runs] [threads]
+//! cargo run --release --example av1_decbench -- input.{ivf,mp4} [runs] [threads]
 
 #[path = "common/mp4.rs"]
 mod mp4;

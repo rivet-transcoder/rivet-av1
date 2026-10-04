@@ -7,7 +7,7 @@
 //! average (negative: fewer bits for the same quality).
 //!
 //! ```text
-//! cargo run --release --example rdcurve -- \
+//! cargo run --release --example av1_rdcurve -- \
 //!     --out new.csv [--compare base.csv] [--frames 10] [--qs 64,96,128,160,192] \
 //!     [--set name=value ...] clip1.y4m clip2.y4m ...
 //! ```

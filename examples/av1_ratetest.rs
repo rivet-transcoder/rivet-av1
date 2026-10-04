@@ -7,7 +7,7 @@
 //! (fresh decoder) to exactly the encoder's reconstruction.
 //!
 //! ```text
-//! cargo run --release --example ratetest -- [--speed 6] [--rates 300,1000] \
+//! cargo run --release --example av1_ratetest -- [--speed 6] [--rates 300,1000] \
 //!     [--frames 300] [--key 240] clip1.y4m clip2.y4m ...
 //! ```
 

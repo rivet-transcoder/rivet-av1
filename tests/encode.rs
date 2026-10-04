@@ -434,7 +434,7 @@ fn natural_video_quality_tracks_the_quantiser() {
 }
 
 /// Average-bitrate mode spends its budget: over 24 frames of natural video
-/// (a key frame first), within 8 % of the target (`examples/ratetest.rs`
+/// (a key frame first), within 8 % of the target (`examples/av1_ratetest.rs`
 /// measures 10-second clips of several kinds).
 #[test]
 fn rate_control_tracks_the_target() {

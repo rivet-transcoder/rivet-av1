@@ -1,6 +1,6 @@
 //! Decodes an AV1 stream (IVF, or the first AV1 track of an MP4) to a Y4M
 //! file: the sources of the encoder's rate-distortion measurements
-//! (`examples/rdcurve.rs`) come from here.
+//! (`examples/av1_rdcurve.rs`) come from here.
 //!
 //! cargo run --release --example av1toy4m -- input.{ivf,mp4} output.y4m [max_frames] [crop WxH]
 //!

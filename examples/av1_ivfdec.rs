@@ -1,6 +1,6 @@
 //! Decodes an IVF file and prints each shown frame's size and MD5.
 //!
-//! cargo run --release --example ivfdec -- input.ivf
+//! cargo run --release --example av1_ivfdec -- input.ivf
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();

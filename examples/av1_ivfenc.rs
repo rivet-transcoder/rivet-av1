@@ -1,8 +1,8 @@
 //! Encodes raw 8-bit 4:2:0 planar video (I420), or a Y4M file (8- or
 //! 10-bit 4:2:0), to an AV1 IVF file.
 //!
-//! cargo run --release --example ivfenc -- input.yuv WIDTH HEIGHT output.ivf [QUANTIZER] [settings]
-//! cargo run --release --example ivfenc -- input.y4m output.ivf [QUANTIZER] [settings]
+//! cargo run --release --example av1_ivfenc -- input.yuv WIDTH HEIGHT output.ivf [QUANTIZER] [settings]
+//! cargo run --release --example av1_ivfenc -- input.y4m output.ivf [QUANTIZER] [settings]
 //!
 //! Settings are `name=value`: `speed`, `tiles` (tile columns, log2),
 //! `threads`, `frames` (at most this many), `key` (key frame interval),

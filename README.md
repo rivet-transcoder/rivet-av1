@@ -89,7 +89,7 @@ inverse transforms (eight rows or columns at a time; the 64-bit scalar
 transforms remain for 12-bit and lossless) and the loop filter (the four
 samples along an edge at once). `AV1_NO_SIMD=1` turns them off.
 
-Throughput (`examples/decbench.rs`, best of three, on the machine this was
+Throughput (`examples/av1_decbench.rs`, best of three, on the machine this was
 written on — an AMD Ryzen 9 9950X), on 30-frame streams of camera
 footage from this crate's encoder at quantiser 100, one tile column or four:
 
@@ -202,7 +202,7 @@ sample.
 
 ### How well, and how fast
 
-`examples/rdcurve.rs` is the measurement harness: it encodes Y4M clips at
+`examples/av1_rdcurve.rs` is the measurement harness: it encodes Y4M clips at
 several quantisers, checks every temporal unit against a fresh decoder,
 and reports the Bjøntegaard delta rate (BD-rate: the change in bits at the
 same PSNR; negative is better) against an earlier run.
@@ -256,7 +256,7 @@ quantisers) 0.17x the time at −1.6 %. At 1080x720 it codes 1.6
 megapixels/s on one thread (2.0 frames/s), 2.9 on two, 4.7 on four and
 5.6 on eight — the same stream on each.
 
-Rate control, `examples/ratetest.rs`: 10-second clips (300 frames,
+Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
 300 and 1000 kb/s, speed 6:
@@ -339,7 +339,7 @@ Not there yet:
   list OBUs, unsupported) and the error-resilience directories (no
   reference output) are not run.
 - **The encoder** (`tests/encode.rs`, and every run of
-  `examples/rdcurve.rs`): every temporal unit, decoded by a fresh decoder
+  `examples/av1_rdcurve.rs`): every temporal unit, decoded by a fresh decoder
   with the padding check on, equals the encoder's reconstruction exactly —
   key frames at several quantisers, inter frames, 10-bit, sizes from 1x1,
   several tile columns coded in parallel (the same stream as in turn), HDR
